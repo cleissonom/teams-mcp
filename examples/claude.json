@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "teams_rust": {
+      "type": "stdio",
+      "command": "/absolute/path/to/teams-mcp/target/release/teams-mcp",
+      "args": []
+    }
+  }
+}

@@ -1,0 +1,4 @@
+[mcp_servers.teams_rust]
+command = "/absolute/path/to/teams-mcp/target/release/teams-mcp"
+startup_timeout_sec = 10
+tool_timeout_sec = 90

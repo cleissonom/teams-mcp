@@ -1,0 +1,5 @@
+[mcp_servers.teams_rust]
+command = "/absolute/path/to/teams-mcp/target/release/teams-mcp"
+args = ["--auth-source", "browser"]
+startup_timeout_sec = 10
+tool_timeout_sec = 90

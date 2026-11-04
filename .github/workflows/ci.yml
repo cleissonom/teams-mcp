@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Test Rust
+        run: cargo +stable test --locked
+      - name: Lint Rust
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Test bridge
+        run: node --test tests/bridge.cjs
+      - name: Test source packaging
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Build release
+        run: cargo +stable build --release --locked
+      - name: Check source archive
+        run: |
+          python3 scripts/package-release.py
+          python3 -m zipfile -t dist/*-source.zip
+      - name: Scan public source for secrets
+        if: runner.os == 'Linux'
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          python3 -m zipfile -e dist/*-source.zip "$RUNNER_TEMP/teams-mcp-source"
+          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/teams-mcp-source" --redact --no-banner
