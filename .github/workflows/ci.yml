@@ -50,3 +50,18 @@ jobs:
           tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
           python3 -m zipfile -e dist/*-source.zip "$RUNNER_TEMP/teams-mcp-source"
           "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/teams-mcp-source" --redact --no-banner
+
+  windows:
+    # Synthetic compile check only; Windows has not been live-qualified.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Check
+        run: cargo +stable check --locked --lib --bins
+      - name: Lint
+        run: cargo +stable clippy --locked --lib --bins -- -D warnings

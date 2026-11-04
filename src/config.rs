@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 use url::Url;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -22,7 +22,29 @@ impl std::str::FromStr for AuthSource {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserKind {
+    Chrome,
+    Edge,
+    Chromium,
+    Brave,
+}
+
+impl std::str::FromStr for BrowserKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "chrome" => Ok(Self::Chrome),
+            "edge" => Ok(Self::Edge),
+            "chromium" => Ok(Self::Chromium),
+            "brave" => Ok(Self::Brave),
+            _ => Err("TEAMS_BROWSER must be chrome, edge, chromium or brave.".into()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub auth_source: AuthSource,
     pub browser_binary: Option<PathBuf>,
@@ -34,6 +56,42 @@ pub struct Config {
     pub target_id: Option<String>,
     pub account: Option<String>,
     pub tenant: Option<String>,
+    /// Upper bound for one tool call, including a cold browser start.
+    pub request_timeout: Duration,
+    /// Stop the managed headless browser after this much inactivity.
+    pub idle: Duration,
+    /// Freeze the managed Teams page after this much inactivity; `None` keeps it running.
+    pub freeze: Option<Duration>,
+    pub cache_limit_mb: Option<u64>,
+    pub browser: Option<BrowserKind>,
+    pub lean: bool,
+    pub prewarm: bool,
+    pub log: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            auth_source: AuthSource::default(),
+            browser_binary: None,
+            browser_profile: None,
+            app_window_id: None,
+            app_cdp_url: None,
+            cdp_url: None,
+            port_file: None,
+            target_id: None,
+            account: None,
+            tenant: None,
+            request_timeout: Duration::from_secs(65),
+            idle: Duration::from_secs(300),
+            freeze: Some(Duration::from_secs(15)),
+            cache_limit_mb: None,
+            browser: None,
+            lean: false,
+            prewarm: false,
+            log: false,
+        }
+    }
 }
 
 impl Config {
@@ -67,6 +125,26 @@ impl Config {
             target_id: env::var("TEAMS_TARGET_ID").ok(),
             account: env::var("TEAMS_ACCOUNT").ok(),
             tenant: env::var("TEAMS_TENANT_ID").ok(),
+            request_timeout: Duration::from_secs(
+                seconds("TEAMS_REQUEST_TIMEOUT_SECS", 10, 300)?.unwrap_or(65),
+            ),
+            idle: Duration::from_secs(
+                seconds("TEAMS_BROWSER_IDLE_SECS", 90, 86_400)?.unwrap_or(300),
+            ),
+            freeze: match env::var("TEAMS_BROWSER_FREEZE_SECS").as_deref() {
+                Ok("0") => None,
+                _ => Some(Duration::from_secs(
+                    seconds("TEAMS_BROWSER_FREEZE_SECS", 5, 3600)?.unwrap_or(15),
+                )),
+            },
+            cache_limit_mb: seconds("TEAMS_BROWSER_CACHE_LIMIT_MB", 50, 100_000)?,
+            browser: env::var("TEAMS_BROWSER")
+                .ok()
+                .map(|value| value.parse())
+                .transpose()?,
+            lean: flag("TEAMS_BROWSER_LEAN"),
+            prewarm: flag("TEAMS_PREWARM"),
+            log: flag("TEAMS_MCP_LOG"),
         })
     }
 
@@ -92,7 +170,7 @@ impl Config {
         let file = self
             .port_file
             .clone()
-            .or_else(default_port_file)
+            .or_else(|| default_port_file(self.browser))
             .ok_or("Set TEAMS_CDP_URL or TEAMS_CDP_PORT_FILE for the existing browser.")?;
         let content = tokio::fs::read_to_string(file).await
             .map_err(|_| "Cannot read DevToolsActivePort. Enable remote debugging in the existing Chrome browser.")?;
@@ -100,15 +178,73 @@ impl Config {
     }
 }
 
-fn default_port_file() -> Option<PathBuf> {
-    let home = PathBuf::from(env::var_os("HOME")?);
-    if cfg!(target_os = "macos") {
-        Some(home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"))
-    } else if cfg!(target_os = "linux") {
-        Some(home.join(".config/google-chrome/DevToolsActivePort"))
-    } else {
-        None
-    }
+fn seconds(name: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (min..=max).contains(value))
+        .map(Some)
+        .ok_or_else(|| format!("{name} must be an integer from {min} to {max}."))
+}
+
+fn flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| !matches!(value.as_str(), "" | "0" | "false"))
+}
+
+/// Profile directories of installed Chromium browsers, in preference order.
+fn browser_data_directories(kind: Option<BrowserKind>) -> Vec<PathBuf> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let all: &[(BrowserKind, &str, &str)] = &[
+        (
+            BrowserKind::Chrome,
+            "Library/Application Support/Google/Chrome",
+            ".config/google-chrome",
+        ),
+        (
+            BrowserKind::Edge,
+            "Library/Application Support/Microsoft Edge",
+            ".config/microsoft-edge",
+        ),
+        (
+            BrowserKind::Chromium,
+            "Library/Application Support/Chromium",
+            ".config/chromium",
+        ),
+        (
+            BrowserKind::Brave,
+            "Library/Application Support/BraveSoftware/Brave-Browser",
+            ".config/BraveSoftware/Brave-Browser",
+        ),
+    ];
+    all.iter()
+        .filter(|(candidate, _, _)| kind.is_none_or(|kind| kind == *candidate))
+        .filter_map(|(_, macos, linux)| {
+            if cfg!(target_os = "macos") {
+                Some(home.join(macos))
+            } else if cfg!(target_os = "linux") {
+                Some(home.join(linux))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn default_port_file(kind: Option<BrowserKind>) -> Option<PathBuf> {
+    let candidates: Vec<_> = browser_data_directories(kind)
+        .into_iter()
+        .map(|directory| directory.join("DevToolsActivePort"))
+        .collect();
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .or_else(|| candidates.first())
+        .cloned()
 }
 
 pub fn validate_endpoint(endpoint: &str) -> Result<String, String> {

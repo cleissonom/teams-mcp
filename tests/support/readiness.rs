@@ -17,9 +17,12 @@ const TEAMS: &str = "https://teams.microsoft.com/v2/";
 #[derive(Default)]
 struct Counts {
     targets: usize,
+    attachments: usize,
+    installs: usize,
     evaluations: usize,
     reloads: usize,
     detachments: usize,
+    activations: usize,
     selection_bound: bool,
 }
 
@@ -43,7 +46,8 @@ async fn headless_waits_for_blank_navigation_and_cold_authentication_to_be_ready
     assert_eq!(result.unwrap()["ok"], true);
     assert_eq!(counts.targets, 3);
     assert_eq!(counts.evaluations, 2);
-    assert_eq!(counts.detachments, 2);
+    assert_eq!((counts.attachments, counts.installs), (1, 1));
+    assert_eq!(counts.detachments, 0);
     assert_eq!(counts.reloads, 0);
 }
 
@@ -62,7 +66,7 @@ async fn headless_restoration_waits_through_transient_navigation_without_trustin
         assert_eq!(result.unwrap()["ok"], true);
         assert_eq!(counts.targets, 2);
         assert_eq!(counts.evaluations, 1);
-        assert_eq!(counts.detachments, 1);
+        assert_eq!(counts.attachments, 1);
     }
 }
 
@@ -132,7 +136,8 @@ async fn managed_expiry_reloads_once_and_retries_after_normal_authentication_loa
     assert_eq!(result.unwrap()["ok"], true);
     assert_eq!(counts.reloads, 1);
     assert_eq!(counts.evaluations, 3);
-    assert_eq!(counts.detachments, 3);
+    // Reloading destroys the installed bridge context; the page session stays attached.
+    assert_eq!((counts.attachments, counts.installs), (1, 2));
 }
 
 #[tokio::test]
@@ -182,6 +187,23 @@ async fn untrusted_targets_are_never_attached_and_headless_wait_is_bounded() {
 }
 
 #[tokio::test]
+async fn managed_restore_navigation_during_bridge_install_is_retried() {
+    let (result, counts) = run_with(&[TEAMS], &[ready()], AuthSource::Headless, 1).await;
+    assert_eq!(result.unwrap()["ok"], true);
+    assert_eq!(counts.attachments, 2, "the failed page session is replaced");
+    assert_eq!(counts.detachments, 1);
+}
+
+#[tokio::test]
+async fn managed_calls_activate_a_frozen_page_but_existing_browsers_are_never_touched() {
+    for source in [AuthSource::Headless, AuthSource::Browser] {
+        let (result, counts) = run(&[TEAMS], &[ready()], source).await;
+        assert!(result.is_ok());
+        assert_eq!(counts.activations > 0, source == AuthSource::Headless);
+    }
+}
+
+#[tokio::test]
 async fn existing_browser_authentication_errors_remain_immediate() {
     for code in ["AUTH_REQUIRED", "AUTH_EXPIRED"] {
         let (result, counts) = run(&[TEAMS], &[error(code)], AuthSource::Browser).await;
@@ -203,7 +225,16 @@ async fn run(
     outputs: &[Value],
     source: AuthSource,
 ) -> (Result<Value, Failure>, Counts) {
-    let (endpoint, server) = fixture(urls, outputs).await;
+    run_with(urls, outputs, source, 0).await
+}
+
+async fn run_with(
+    urls: &[&str],
+    outputs: &[Value],
+    source: AuthSource,
+    install_failures: usize,
+) -> (Result<Value, Failure>, Counts) {
+    let (endpoint, server) = fixture(urls, outputs, install_failures).await;
     let browser = transport::Browser::new(Config {
         auth_source: source,
         cdp_url: Some(endpoint),
@@ -219,7 +250,11 @@ async fn run(
     (result, server.await.unwrap())
 }
 
-async fn fixture(urls: &[&str], outputs: &[Value]) -> (String, JoinHandle<Counts>) {
+async fn fixture(
+    urls: &[&str],
+    outputs: &[Value],
+    mut install_failures: usize,
+) -> (String, JoinHandle<Counts>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
         "ws://{}/devtools/browser/readiness",
@@ -243,16 +278,38 @@ async fn fixture(urls: &[&str], outputs: &[Value]) -> (String, JoinHandle<Counts
                         json!({"targetInfos":[{"targetId":"teams","type":"page","url":url}]})
                     }
                 }
-                "Target.attachToTarget" => json!({"sessionId":"fixture"}),
+                "Target.attachToTarget" => {
+                    counts.attachments += 1;
+                    json!({"sessionId":"fixture"})
+                }
+                "Page.setWebLifecycleState" => {
+                    assert_eq!(call["params"]["state"], "active");
+                    counts.activations += 1;
+                    json!({})
+                }
                 "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
+                "Page.createIsolatedWorld" if install_failures > 0 => {
+                    // A restoring page navigated away while the bridge was being installed.
+                    install_failures -= 1;
+                    ws.send(Message::Text(
+                        json!({"id":call["id"],"error":{"code":-32000,"message":"Cannot find frame"}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    continue;
+                }
                 "Page.createIsolatedWorld" => json!({"executionContextId":42}),
                 "Runtime.evaluate" => {
+                    counts.installs += 1;
+                    json!({"result":{"objectId":"bridge"}})
+                }
+                "Runtime.callFunctionOn" => {
                     counts.evaluations += 1;
-                    let expression = call["params"]["expression"].as_str().unwrap();
-                    counts.selection_bound = expression
-                        .contains("\"expectedAccount\":\"fixture@example.test\"")
-                        && expression
-                            .contains("\"tenantId\":\"11111111-2222-4333-8444-555555555555\"");
+                    let input = &call["params"]["arguments"][0]["value"];
+                    counts.selection_bound = input["expectedAccount"] == "fixture@example.test"
+                        && input["tenantId"] == "11111111-2222-4333-8444-555555555555";
                     json!({"result":{"value":next(&mut outputs)}})
                 }
                 "Page.reload" => {

@@ -37,8 +37,11 @@ cargo build --release --locked
 ```
 
 The official Rust MCP SDK handles framing and protocol negotiation. `managed.rs`
-owns the optional shared headless Chrome lifecycle. `server.rs` selects `cdp.rs`
-or the macOS Apple Events adapter in `app.rs`; both run `bridge.js` inside the
-selected session. `operations.rs` builds allowlisted read requests, and
-`normalize.rs` bounds and normalizes results. See `docs/reverse-engineering.md`
+owns the optional shared headless Chrome lifecycle, including freezing the idle
+Teams page and Service Worker cache compaction; never disable Chrome security
+components there. `server.rs` selects `cdp.rs` (one multiplexed connection, bridge
+installed once per page context) or the macOS Apple Events adapter in `app.rs`;
+both run `bridge.js` inside the selected session. `operations.rs` declares each
+tool once (schema, validation, allowlisted requests, optional batched follow-up
+reads), and `normalize.rs` bounds and compacts results. See `docs/reverse-engineering.md`
 for observations, limitations and evidence provenance.

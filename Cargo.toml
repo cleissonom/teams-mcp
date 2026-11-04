@@ -2,7 +2,7 @@
 name = "teams-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Read-only Teams MCP with managed headless Chrome and existing browser or app sessions"
 license = "MIT"
 readme = "README.md"
@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 include = [
     "/src/**/*.rs", "/src/bridge.js", "/tests/**/*.rs", "/tests/*.cjs", "/tests/test_*.py",
     "/scripts/*.py", "/examples/*.json", "/examples/*.toml", "/docs/*.md",
-    "/.github/workflows/ci.yml", "/.gitignore", "/AGENTS.md", "/README.md",
+    "/.github/workflows/ci.yml", "/.github/workflows/release.yml", "/.gitignore", "/AGENTS.md", "/README.md",
     "/CONTRIBUTING.md", "/SECURITY.md", "/LICENSE", "/NOTICE", "/release-files.txt",
     "/Cargo.toml", "/Cargo.lock",
 ]
@@ -27,10 +27,17 @@ url = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
-fs2 = "0.4"
+# Hostnames are compared as exact ASCII; this stub IDNA back end avoids the ICU4X data tree.
+idna_adapter = "=1.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true

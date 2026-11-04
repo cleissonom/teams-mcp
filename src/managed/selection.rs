@@ -75,53 +75,50 @@ pub(super) fn startup_url(config: &Config) -> Result<String, Failure> {
     Ok(url.into())
 }
 
-pub(super) async fn persist(config: &Config, path: &Path, endpoint: &str) {
-    let Ok(mut snapshot) = effective(config) else {
-        return;
-    };
+/// Saves the identity of the session at `endpoint` when it matches the configured selection.
+pub(super) async fn persist(config: &Config, path: &Path, endpoint: &str) -> bool {
+    match identity(config, endpoint).await {
+        Some((email, tenant)) => save(path, email, tenant),
+        None => false,
+    }
+}
+
+/// Reads the signed-in account and tenant without saving them. Returns `None` while
+/// sign-in is incomplete or when the session conflicts with an explicit selection.
+pub(super) async fn identity(config: &Config, endpoint: &str) -> Option<(String, String)> {
+    let mut snapshot = effective(config).ok()?;
     snapshot.auth_source = AuthSource::Browser;
     snapshot.cdp_url = Some(endpoint.into());
     snapshot.target_id = None;
+    snapshot.request_timeout = Duration::from_secs(5);
     let selected = snapshot.clone();
     let Ok(Ok(response)) = timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(6),
         Browser::new(snapshot).evaluate(json!({"action":"status"})),
     )
     .await
     else {
-        return;
+        return None;
     };
     if response["ok"] != true {
-        return;
+        return None;
     }
-    let (Some(email), Some(raw_tenant)) = (
-        response["profile"]["email"].as_str(),
-        response["profile"]["tenantId"].as_str(),
-    ) else {
-        return;
-    };
-    let Ok(tenant) = tenant(raw_tenant) else {
-        return;
-    };
-    if !valid_email(email)
-        || selected
-            .account
-            .as_deref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case(email))
+    let email = response["profile"]["email"].as_str()?;
+    let tenant = tenant(response["profile"]["tenantId"].as_str()?).ok()?;
+    let conflicts = selected
+        .account
+        .as_deref()
+        .is_some_and(|value| !value.eq_ignore_ascii_case(email))
         || selected
             .tenant
             .as_deref()
-            .is_some_and(|value| value != tenant)
-    {
-        return;
-    }
-    let selection = Selection {
-        email: email.into(),
-        tenant,
-    };
-    if let Ok(bytes) = serde_json::to_vec(&selection) {
-        let _ = write_private(&path.join(FILE), &bytes);
-    }
+            .is_some_and(|value| value != tenant);
+    (valid_email(email) && !conflicts).then(|| (email.to_owned(), tenant))
+}
+
+pub(super) fn save(path: &Path, email: String, tenant: String) -> bool {
+    serde_json::to_vec(&Selection { email, tenant })
+        .is_ok_and(|bytes| write_private(&path.join(FILE), &bytes).is_ok())
 }
 
 fn tenant(value: &str) -> Result<String, Failure> {

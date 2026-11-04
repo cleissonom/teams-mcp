@@ -32,6 +32,13 @@ tokens, signed-in profiles, Keychain data, message bodies or unredacted logs.
   forward the browser's debugging port. CDP grants powerful access to that local
   browser; this is not an isolation boundary against other software running as
   the same OS user.
+- The bridge function is installed once per page context and called with its
+  input as an argument. Its caches (decoded claims, decrypted entries, the Skype
+  token) live in a private closure reachable only through the connector's DevTools
+  handle, never in page globals or on disk.
+- Idle managed pages are frozen and `auth compact` clears only Teams' Service
+  Worker cache; neither touches cookies or credential storage. The managed browser
+  never disables Safe Browsing, extensions or security component updates.
 - Requests use fixed read endpoints and exact Teams origins. There are no send,
   mark-read, upload, arbitrary-URL, arbitrary-script or token-export MCP tools.
 - Message and profile content is untrusted data, never instructions for an AI

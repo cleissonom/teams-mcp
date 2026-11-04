@@ -3,7 +3,6 @@ use crate::{
     config::{Config, endpoint_from_port_file, validate_endpoint},
     error::Failure,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -18,6 +17,9 @@ pub(super) const STATE: &str = ".teams-mcp-state.json";
 pub(super) const HEARTBEAT: &str = ".teams-mcp-heartbeat";
 pub(super) const STOP: &str = ".teams-mcp-stop";
 pub(super) const ERROR: &str = ".teams-mcp-error.json";
+/// Present while the supervisor has frozen the idle Teams page; contains the worker nonce.
+pub(super) const FROZEN: &str = ".teams-mcp-frozen";
+pub(super) const LOG: &str = ".teams-mcp-worker.log";
 pub(super) const START_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Serialize, Deserialize)]
@@ -26,6 +28,11 @@ pub(super) struct State {
     pub(super) nonce: String,
     pub(super) endpoint: String,
     pub(super) headed: bool,
+    /// Lifecycle limits chosen by the worker, reported by the offline status command.
+    #[serde(default)]
+    pub(super) idle_secs: u64,
+    #[serde(default)]
+    pub(super) freeze_secs: Option<u64>,
 }
 pub(super) enum Running {
     Stopped,
@@ -33,12 +40,20 @@ pub(super) enum Running {
     Ready(State),
 }
 
-pub(super) fn publish(profile: &Path, endpoint: String, headed: bool) -> Result<State, Failure> {
+pub(super) fn publish(
+    profile: &Path,
+    endpoint: String,
+    headed: bool,
+    idle: Duration,
+    freeze: Option<Duration>,
+) -> Result<State, Failure> {
     let state = State {
         version: 1,
         nonce: uuid::Uuid::new_v4().to_string(),
         endpoint,
         headed,
+        idle_secs: idle.as_secs(),
+        freeze_secs: freeze.map(|freeze| freeze.as_secs()),
     };
     write_private(
         &profile.join(STATE),
@@ -50,9 +65,9 @@ pub(super) fn publish(profile: &Path, endpoint: String, headed: bool) -> Result<
 
 pub(super) fn worker_stopped(profile: &Path) -> Result<bool, Failure> {
     let guard = lock_file(&profile.join(".teams-mcp-worker.lock"))?;
-    match guard.try_lock_exclusive() {
+    match guard.try_lock() {
         Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
         Err(_) => Err(failure("BROWSER_STATE_INVALID")),
     }
 }
@@ -82,9 +97,9 @@ pub(super) async fn startup_lock(profile: &Path) -> Result<File, Failure> {
     let guard = lock_file(&profile.join(".teams-mcp-start.lock"))?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        match guard.try_lock_exclusive() {
+        match guard.try_lock() {
             Ok(()) => return Ok(guard),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(std::fs::TryLockError::WouldBlock) => {}
             Err(_) => return Err(failure("BROWSER_STATE_INVALID")),
         }
         if Instant::now() >= deadline {
@@ -196,4 +211,70 @@ pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
 }
 pub(super) fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Seconds since the last recorded tool activity, when known.
+pub(super) fn idle_seconds(profile: &Path) -> Option<u64> {
+    SystemTime::now()
+        .duration_since(modified(&profile.join(HEARTBEAT))?)
+        .ok()
+        .map(|age| age.as_secs())
+}
+
+/// Whether Chrome's profile lock belongs to a live process. A symlink naming a dead
+/// process on this host is stale: Chrome reclaims it itself, so the connector may
+/// start Chrome without touching the lock. Anything else is treated as in use.
+pub(super) fn profile_in_use(profile: &Path) -> bool {
+    let lock = profile.join("SingletonLock");
+    if fs::symlink_metadata(&lock).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Ok(target) = fs::read_link(&lock)
+        && let Some((host, pid)) = target.to_str().and_then(|value| value.rsplit_once('-'))
+        && let Ok(pid) = pid.parse::<libc::pid_t>()
+        && pid > 0
+        && Some(host) == hostname().as_deref()
+    {
+        // kill(pid, 0) sends no signal; ESRCH means no such process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        return alive;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+/// Appends one sanitized lifecycle event when TEAMS_MCP_LOG is enabled.
+pub(super) fn log_event(profile: &Path, enabled: bool, event: &str) {
+    if !enabled {
+        return;
+    }
+    let path = profile.join(LOG);
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 256 * 1024) {
+        let _ = fs::remove_file(&path);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |time| time.as_secs());
+        let _ = writeln!(file, "{now} {event}");
+    }
 }

@@ -10,7 +10,7 @@ const jwt = claims => `${b64('{}')}.${b64(JSON.stringify(claims))}.synthetic`;
 const claims = {oid:'user-one',tid:'tenant-one',upn:'tester@example.test',name:'Test User',exp:4102444800,aud:'https://substrate.office.com'};
 const token = {credentialType:'AccessToken',secret:jwt(claims),target:'https://substrate.office.com/SubstrateSearch-Internal.ReadWrite',clientId:client};
 function environment(entries, cookie='', fetch=async()=>{throw Error('unexpected network')},origin='https://teams.microsoft.com') {
-  const context = {localStorage:entries,sessionStorage:{},document:{cookie},location:{origin},crypto:webcrypto,TextEncoder,TextDecoder,Uint8Array,URL,URLSearchParams,AbortSignal,atob,fetch};
+  const context = {localStorage:entries,sessionStorage:{},document:{cookie},location:{origin},crypto:webcrypto,TextEncoder,TextDecoder,Uint8Array,URL,URLSearchParams,AbortSignal,atob,fetch,setTimeout,Intl};
   return vm.runInNewContext(`(${source})`,context);
 }
 function encryptedFixture() {
@@ -183,3 +183,65 @@ test('credential export is not a supported bridge operation',async()=>{
  assert.ok(!JSON.stringify(status).includes('own-refresh-marker'));
 });
 
+
+const spaces={...token,secret:jwt({...claims,aud:'https://api.spaces.skype.com'}),target:'https://api.spaces.skype.com/.default'};
+const region=(base='https://teams.microsoft.com/api/chatsvc/amer')=>({'DISCOVER-REGION-GTM':JSON.stringify({item:{chatServiceAfd:base,chatSvcAggAfd:'https://teams.microsoft.com/api/csa/amer'}})});
+const json=(body,init={})=>new Response(JSON.stringify(body),{headers:{'Content-Type':'application/json'},...init});
+const chatRequest={service:'chat',path:'/v1/users/ME/conversations',method:'GET',query:[],body:null};
+const chatStorage=extra=>({[cacheKey]:JSON.stringify(token),'spaces-accesstoken':JSON.stringify(spaces),...extra});
+
+test('reads only the storage values it needs instead of copying all storage',async()=>{
+ const reads=[];const entries=new Proxy({[cacheKey]:JSON.stringify(token),'unrelated-large-value':'x'.repeat(4096)},{get(target,key){if(typeof key==='string')reads.push(key);return target[key];}});
+ const result=await environment(entries)({action:'status'});
+ assert.equal(result.ok,true);assert.ok(reads.includes(cacheKey));assert.ok(!reads.includes('unrelated-large-value'));
+});
+test('decrypts unchanged encrypted entries once across calls',async()=>{
+ const fixture=encryptedFixture();let decrypts=0;
+ const subtle=new Proxy(webcrypto.subtle,{get(target,key){const value=target[key];if(key==='decrypt')return (...args)=>{decrypts++;return value.apply(target,args);};return typeof value==='function'?value.bind(target):value;}});
+ const context={localStorage:{[cacheKey]:fixture.entry},sessionStorage:{},document:{cookie:fixture.cookie},location:{origin:'https://teams.microsoft.com'},crypto:{subtle,randomUUID:()=>webcrypto.randomUUID()},TextEncoder,TextDecoder,Uint8Array,URL,AbortSignal,atob,setTimeout};
+ const run=vm.runInNewContext(`(${source})`,context);
+ assert.equal((await run({action:'status'})).ok,true);const first=decrypts;
+ assert.equal((await run({action:'status'})).ok,true);
+ assert.ok(first>0);assert.equal(decrypts,first);
+});
+test('reuses one Skype token per account until expiry and renews it once after 401',async()=>{
+ const calls={authz:0,data:0};let reject=false;
+ const run=environment(chatStorage(region()),'',async url=>{
+  if(new URL(url).hostname==='authsvc.teams.microsoft.com'){calls.authz++;return json({tokens:{skypeToken:`skype-${calls.authz}`,expiresIn:3600}});}
+  calls.data++;if(reject){reject=false;return json({},{status:401});}return json({conversations:[]});
+ });
+ for(let i=0;i<3;i++) assert.equal((await run({action:'request',request:chatRequest})).ok,true);
+ assert.deepEqual(calls,{authz:1,data:3});
+ reject=true;const renewed=await run({action:'request',request:chatRequest});
+ assert.equal(renewed.ok,true);assert.deepEqual(calls,{authz:2,data:5});
+ assert.ok(!JSON.stringify(renewed).includes('skype-'));
+});
+test('retries one transient failure or short rate limit, then reports the error',async()=>{
+ const statuses=[429,200];const seen=[];
+ const run=environment({[cacheKey]:JSON.stringify(token)},'',async()=>{const status=statuses.shift()??500;seen.push(status);return status===200?json({EntitySets:[]}):json({},{status,headers:{'Retry-After':'0'}});});
+ const search={action:'request',request:{service:'substrate',path:'/searchservice/api/v2/query',method:'POST',query:[],body:{}}};
+ assert.equal((await run(search)).ok,true);assert.deepEqual(seen,[429,200]);
+ seen.length=0;const failed=await run(search);
+ assert.equal(failed.error.code,'API_ERROR');assert.deepEqual(seen,[500,500]);
+ const slow=environment({[cacheKey]:JSON.stringify(token)},'',async()=>json({},{status:429,headers:{'Retry-After':'120'}}));
+ assert.equal((await slow(search)).error.code,'RATE_LIMITED');
+});
+test('falls back to the token exchange region only for trusted Teams roots',async()=>{
+ const urls=[];const run=base=>environment(chatStorage(),'',async url=>{urls.push(url);return new URL(url).hostname==='authsvc.teams.microsoft.com'?json({tokens:{skypeToken:'s',expiresIn:600},regionGtms:{chatServiceAfd:base}}):json({conversations:[]});});
+ assert.equal((await run('https://teams.microsoft.com/api/chatsvc/emea')({action:'request',request:chatRequest})).ok,true);
+ assert.ok(urls.some(url=>url.startsWith('https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations')));
+ urls.length=0;const foreign=await run('https://attacker.test/api/chatsvc/emea')({action:'request',request:chatRequest});
+ assert.equal(foreign.error.code,'UNSAFE_ENDPOINT');assert.ok(urls.every(url=>!url.includes('attacker.test')));
+});
+test('batches validated reads and reports per-request errors',async()=>{
+ const run=environment(chatStorage(region()),'',async url=>new URL(url).hostname==='authsvc.teams.microsoft.com'?json({tokens:{skypeToken:'s',expiresIn:600}}):json({messages:[]}));
+ const result=await run({action:'batch',requests:[{...chatRequest,path:'/v1/users/ME/conversations/48%3Anotifications/messages'},{...chatRequest,path:'/v1/users/ME/conversations/../x'}]});
+ assert.equal(result.ok,true);assert.equal(result.data[0].ok,true);assert.equal(result.data[1].error.code,'UNSAFE_ENDPOINT');
+ assert.equal((await run({action:'batch',requests:[]})).error.code,'INVALID_INPUT');
+});
+test('conversation folders are an allowed read and other CSA paths are not',async()=>{
+ const csa={...token,secret:jwt({...claims,aud:'https://chatsvcagg.teams.microsoft.com'}),target:'https://chatsvcagg.teams.microsoft.com/.default'};
+ const run=environment(chatStorage({...region(),'csa-accesstoken':JSON.stringify(csa)}),'',async url=>new URL(url).hostname==='authsvc.teams.microsoft.com'?json({tokens:{skypeToken:'s',expiresIn:600}}):json({conversationFolders:[]}));
+ assert.equal((await run({action:'request',request:{service:'csa',path:'/api/v1/teams/users/me/conversationFolders',method:'GET',query:[],body:null}})).ok,true);
+ assert.equal((await run({action:'request',request:{service:'csa',path:'/api/v1/teams/users/me/other',method:'GET',query:[],body:null}})).error.code,'UNSAFE_ENDPOINT');
+});

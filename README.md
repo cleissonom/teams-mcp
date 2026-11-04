@@ -5,36 +5,39 @@ The default runtime is a Rust binary plus **one shared headless Chrome session**
 it. No Node, Playwright, browser download, separate OAuth app registration, or
 credential-export service is required. Chrome handles normal Microsoft SSO.
 
-The managed browser retains its own profile, is shared across MCP clients, and
-stops after five minutes without tool calls. Its cookies and tokens remain in
-Chrome. Normal tool calls never open a visible window. Existing browser and native
-App adapters remain explicit alternatives.
+The managed browser retains its own profile and is shared across MCP clients. Its
+Teams page is frozen 15 seconds after the last tool call (near-zero CPU) and the
+browser stops after five idle minutes; both are configurable. Its cookies and tokens
+remain in Chrome. Normal tool calls never open a visible window. Existing browser
+and native App adapters remain explicit alternatives.
 
 ## Build and sign in
 
 ```sh
 cd teams-mcp
-cargo build --release --locked
-./target/release/teams-mcp auth login
+cargo install --locked --path .   # or: cargo build --release --locked
+teams-mcp auth login
 ```
 
 Run these commands from the extracted source directory or your Git clone.
-Requires Rust 1.88+ and an installed Chrome/Chromium browser. On macOS, Chrome is
-discovered at its normal application path. `TEAMS_BROWSER_BINARY` selects another
-installed compatible executable. There is no automatic browser installation.
+`cargo install` places the binary at `~/.cargo/bin/teams-mcp`; tagged releases also
+publish prebuilt macOS and Linux binaries. Building requires Rust 1.89+. Running
+requires an installed Chrome, Edge, Chromium or Brave browser, discovered at its
+normal location (Chrome first). `TEAMS_BROWSER=chrome|edge|chromium|brave` picks one;
+`TEAMS_BROWSER_BINARY` selects any other compatible executable. There is no
+automatic browser installation.
 
-`auth login` opens a dedicated browser window for normal Teams sign-in. Complete
-your organization's SSO/MFA and select the intended Teams organization, including
-the resource organization when you are an invited guest. Then run:
+`auth login` opens a dedicated browser window for normal Teams sign-in and waits.
+Complete your organization's SSO/MFA and select the intended Teams organization,
+including the resource organization when you are an invited guest. The command
+shows the signed-in account; press Enter to save it and close the window (without
+a terminal it finishes as soon as sign-in succeeds). `auth login --no-wait` keeps
+the old two-step flow: return immediately, then run `auth stop` after sign-in.
 
-```sh
-./target/release/teams-mcp auth stop
-./target/release/teams-mcp --status
-```
-
-`auth stop` records the selected email and tenant (no credentials), closes only
-this connector's browser, and keeps the signed-in profile. The next tool call
-restores that browser session headlessly, including its session cookies.
+Login records the selected email and tenant (no credentials), closes only this
+connector's browser, and keeps the signed-in profile. The next tool call restores
+that browser session headlessly, including its session cookies. `teams-mcp auth
+status` shows the setup, account and browser state without starting Chrome.
 Microsoft may require sign-in again when the session expires or its access
 requirements change; repeat explicit setup then.
 A running headed setup window must be stopped before switching to headless mode.
@@ -78,7 +81,9 @@ For Codex:
 codex mcp add teams_rust -- "$(pwd)/target/release/teams-mcp"
 ```
 
-Use a 90-second tool timeout to allow a cold browser start. Set the same profile,
+Use a 90-second tool timeout to allow a cold browser start. One MCP process keeps
+one CDP connection and the installed bridge across calls, and concurrent tool calls
+run in parallel. Set the same profile,
 account and tenant environment values in both clients when customizing them.
 These commands register the connector; they do not sign in to Teams.
 Claude Desktop accepts the same `mcpServers` JSON shape; its UI is not tested here.
@@ -113,6 +118,7 @@ The managed headless session works independently of whether the Teams App is ope
 
 Alternative configurations are in `examples/*-browser.*` and `examples/*-app.*`.
 Native Apple Events support is macOS-only; other native platforms are unverified.
+Windows browser discovery is included and CI compiles it, but Windows is not live-qualified.
 
 ## Tools
 
@@ -121,19 +127,34 @@ Native Apple Events support is macOS-only; other native platforms are unverified
 | `teams_status` | Selected account, source and cached API capabilities |
 | `teams_get_me` | Selected account profile and tenant |
 | `teams_login` | Recheck after explicit setup; never opens a sign-in window |
-| `teams_search` | Search messages, with offset pagination |
+| `teams_search` | Search messages with Teams operators and `sender`/`after`/`before` filters; links and offset pagination |
 | `teams_search_people` | People suggestions where the account supports them |
 | `teams_find_channel` | Find channels among joined teams |
+| `teams_list_teams` | Joined teams and their channels |
 | `teams_get_person` | Resolve Teams person identifiers (MRIs) |
-| `teams_list_chats` | Up to 200 recent conversations |
-| `teams_get_message` | One message by conversation and message ID |
-| `teams_get_thread` | Paginated conversation or thread messages |
-| `teams_get_unread` | Read state inferred from available consumption horizons |
+| `teams_get_frequent_contacts` | People you chat with most, from recent conversations |
+| `teams_get_chat` | 1:1 chat ID for a person |
+| `teams_list_chats` | Up to 200 recent conversations (default 20) |
+| `teams_get_favorites` | Pinned conversations |
+| `teams_get_message` | One message by conversation and message ID, with its link |
+| `teams_open_link` | The message behind a Teams message link |
+| `teams_get_thread` | Paginated messages (default 20), optional `since`/`until` window |
+| `teams_get_shared_files` | Files and links shared in a page of messages |
+| `teams_get_activity` | Activity feed: mentions, replies, reactions (`mentionsOnly`) |
+| `teams_get_followed_threads` | Threads you follow |
+| `teams_get_unread` | Read state from consumption horizons; `includeMessages` adds unread messages and counts |
+
+Messages are compact: null fields are omitted, the sender is a name and MRI, and
+reactions, mentions, files, subject, edits and quoted replies appear only when
+present. `maxContentChars` truncates long bodies and marks them `truncated`.
 
 There are no send, mark-read, upload, arbitrary URL, JavaScript execution or
 token-export tools. Message/profile text is untrusted external data. Unread
-coverage is bounded and reports uncertainty. Channel discovery covers joined
-teams. Guest people-search restrictions return `FEATURE_UNAVAILABLE`.
+coverage is bounded and reports uncertainty; empty conversations are counted
+separately rather than reported as unknown. Channel discovery covers joined teams.
+Guest people-search restrictions return `FEATURE_UNAVAILABLE`. Saved messages,
+meetings/transcripts and mailbox search are not offered: their endpoints were
+unavailable or unverifiable on the tested account (see the reverse-engineering notes).
 
 `teams_status` validates cached credentials, not every remote API permission.
 Authenticated search/chat calls test actual access. Teams' private APIs and cache
@@ -175,11 +196,29 @@ selection. Build the project and run `auth login` on the new computer, then
 `auth stop` and `--status`. Sign in normally to an account that can access the
 intended Teams organization. Never move a signed-in profile through Git or email.
 
-## Session lifetime
+## Session lifetime and resource use
 
-The background browser stops after five idle minutes and restarts on the next
-tool call. Its saved profile survives that shutdown. Interactive setup windows
-close after fifteen minutes without connector activity. Microsoft controls how
+The Teams page is frozen 15 seconds after the last tool call and made active again
+by the next one (tens of milliseconds). The background browser stops after five
+idle minutes and restarts on the next tool call. Its saved profile survives that
+shutdown. Interactive setup windows close after fifteen minutes without connector
+activity.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TEAMS_BROWSER_IDLE_SECS` | `300` | Stop the managed browser after this idle time (90–86400) |
+| `TEAMS_BROWSER_FREEZE_SECS` | `15` | Freeze the idle Teams page after this time; `0` disables |
+| `TEAMS_REQUEST_TIMEOUT_SECS` | `65` | Upper bound for one tool call, including a cold start |
+| `TEAMS_BROWSER_CACHE_LIMIT_MB` | unset | At shutdown, clear Teams' Service Worker cache above this size |
+| `TEAMS_BROWSER_LEAN` | off | Experimental: no images and no Microsoft telemetry hosts in the hidden page |
+| `TEAMS_PREWARM` | off | Start the managed browser right after MCP initialization |
+| `TEAMS_MCP_LOG` | off | Timings and error codes (never content) on stderr and in a worker log |
+
+Teams' Service Worker cache can grow to hundreds of megabytes. `teams-mcp auth
+compact` clears only that cache through Chrome; sign-in data stays, and the next
+cold start downloads Teams' files again. The managed browser disables Chrome Sync,
+translation, media routing and optimization-model downloads. Safe Browsing,
+extensions and certificate/component security updates are left enabled. Microsoft controls how
 long authentication remains valid; saving cookies does not extend that lifetime.
 For guest accounts using an emailed one-time code, Microsoft documents a
 [24-hour session](https://learn.microsoft.com/en-us/entra/external-id/one-time-passcode#user-experience-for-one-time-passcode-guest-users).

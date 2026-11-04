@@ -23,133 +23,9 @@ mod managed {
         super::config::validate_endpoint(config.cdp_url.as_deref().unwrap_or(""))
             .map_err(|message| super::error::Failure::new("BROWSER_UNAVAILABLE", &message))
     }
-}
-
-#[tokio::test]
-async fn cdp_attaches_only_to_teams_and_returns_no_session_secrets() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!(
-        "ws://{}/devtools/browser/test",
-        listener.local_addr().unwrap()
-    );
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(socket).await.unwrap();
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let call: Value = serde_json::from_str(&text).unwrap();
-            let result = match call["method"].as_str().unwrap() {
-                "Target.getTargets" => {
-                    json!({"targetInfos":[{"targetId":"unrelated","type":"page","url":"https://mail.example.test/"},{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})
-                }
-                "Target.attachToTarget" => {
-                    assert_eq!(call["params"]["targetId"], "teams");
-                    json!({"sessionId":"attached"})
-                }
-                "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
-                "Page.createIsolatedWorld" => json!({"executionContextId":42}),
-                "Runtime.evaluate" => {
-                    assert_eq!(call["params"]["contextId"], 42);
-                    assert_eq!(call["sessionId"], "attached");
-                    json!({"result":{"value":{"ok":true,"profile":{"email":"test@example.test"},"capabilities":{"search":true}}}})
-                }
-                "Target.detachFromTarget" => {
-                    assert_eq!(call["params"]["sessionId"], "attached");
-                    json!({})
-                }
-                other => panic!("unexpected CDP method: {other}"),
-            };
-            ws.send(Message::Text(
-                json!({"id":call["id"],"result":result}).to_string().into(),
-            ))
-            .await
-            .unwrap();
-        }
-    });
-    let browser = Browser::new(Config {
-        auth_source: teams_mcp::config::AuthSource::Browser,
-        cdp_url: Some(endpoint),
-        ..Default::default()
-    });
-    let result = browser.evaluate(json!({"action":"status"})).await.unwrap();
-    assert_eq!(result["profile"]["email"], "test@example.test");
-    drop(browser);
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn browser_clones_reuse_one_approved_socket_and_detach_each_target_session() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!(
-        "ws://{}/devtools/browser/reuse",
-        listener.local_addr().unwrap()
-    );
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(socket).await.unwrap();
-        let mut evaluations = 0;
-        let mut detachments = 0;
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let call: Value = serde_json::from_str(&text).unwrap();
-            let result = match call["method"].as_str().unwrap() {
-                "Target.getTargets" => {
-                    json!({"targetInfos":[{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})
-                }
-                "Target.attachToTarget" => {
-                    assert_eq!(
-                        evaluations, detachments,
-                        "previous target session must be detached before another evaluation"
-                    );
-                    json!({"sessionId":format!("session-{evaluations}")})
-                }
-                "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
-                "Page.createIsolatedWorld" => json!({"executionContextId":42}),
-                "Runtime.evaluate" => {
-                    assert_eq!(call["sessionId"], format!("session-{evaluations}"));
-                    evaluations += 1;
-                    json!({"result":{"value":{"ok":true,"sequence":evaluations}}})
-                }
-                "Target.detachFromTarget" => {
-                    assert_eq!(
-                        call["params"]["sessionId"],
-                        format!("session-{detachments}")
-                    );
-                    detachments += 1;
-                    json!({})
-                }
-                other => panic!("unexpected CDP method: {other}"),
-            };
-            ws.send(Message::Text(
-                json!({"id":call["id"],"result":result}).to_string().into(),
-            ))
-            .await
-            .unwrap();
-            if detachments == 2 {
-                return (evaluations, detachments);
-            }
-        }
-        (evaluations, detachments)
-    });
-    let browser = Browser::new(Config {
-        auth_source: teams_mcp::config::AuthSource::Browser,
-        cdp_url: Some(endpoint),
-        ..Default::default()
-    });
-    let clone = browser.clone();
-    assert_eq!(
-        browser.evaluate(json!({"action":"status"})).await.unwrap()["sequence"],
-        1
-    );
-    let second = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        clone.evaluate(json!({"action":"status"})),
-    )
-    .await;
-    assert!(
-        second.is_ok(),
-        "second evaluation must reuse the existing approved connection"
-    );
-    assert_eq!(second.unwrap().unwrap()["sequence"], 2);
-    assert_eq!(server.await.unwrap(), (2, 2));
+    pub fn keepalive(_: &super::config::Config) -> Result<(), super::error::Failure> {
+        Ok(())
+    }
 }
 
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
@@ -178,63 +54,182 @@ fn standard_result(method: &str) -> Value {
         "Target.attachToTarget" => json!({"sessionId":"session"}),
         "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
         "Page.createIsolatedWorld" => json!({"executionContextId":42}),
-        "Runtime.evaluate" => json!({"result":{"value":{"ok":true}}}),
+        "Runtime.evaluate" => json!({"result":{"type":"function","objectId":"bridge"}}),
+        "Runtime.callFunctionOn" => json!({"result":{"value":{"ok":true}}}),
         "Target.detachFromTarget" => json!({}),
         other => panic!("unexpected method: {other}"),
     }
 }
 
-async fn complete_evaluation(socket: &mut TestSocket) {
-    for method in [
-        "Target.getTargets",
-        "Target.attachToTarget",
-        "Page.getFrameTree",
-        "Page.createIsolatedWorld",
-        "Runtime.evaluate",
-        "Target.detachFromTarget",
-    ] {
+const INSTALL: [&str; 6] = [
+    "Target.getTargets",
+    "Target.attachToTarget",
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+];
+
+async fn expect_sequence(socket: &mut TestSocket, methods: &[&str]) {
+    for method in methods {
         let call = receive_call(socket).await;
-        assert_eq!(call["method"], method);
+        assert_eq!(call["method"], *method);
         reply(socket, &call, standard_result(method)).await;
     }
 }
 
-#[tokio::test]
-async fn cancelled_evaluation_drops_pending_socket_before_the_next_call() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!(
-        "ws://{}/devtools/browser/cancel",
-        listener.local_addr().unwrap()
-    );
-    let (started, pending) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut first = accept_async(socket).await.unwrap();
-        for method in [
-            "Target.getTargets",
-            "Target.attachToTarget",
-            "Page.getFrameTree",
-            "Page.createIsolatedWorld",
-        ] {
-            let call = receive_call(&mut first).await;
-            assert_eq!(call["method"], method);
-            reply(&mut first, &call, standard_result(method)).await;
-        }
-        assert_eq!(receive_call(&mut first).await["method"], "Runtime.evaluate");
-        started.send(()).unwrap();
-        assert!(
-            !matches!(first.next().await, Some(Ok(Message::Text(_)))),
-            "cancelled socket must not receive another request"
-        );
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut second = accept_async(socket).await.unwrap();
-        complete_evaluation(&mut second).await;
-    });
-    let browser = Browser::new(Config {
+fn browser(endpoint: String) -> Browser {
+    Browser::new(Config {
         auth_source: teams_mcp::config::AuthSource::Browser,
         cdp_url: Some(endpoint),
         ..Default::default()
+    })
+}
+
+async fn listener(name: &str) -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "ws://{}/devtools/browser/{name}",
+        listener.local_addr().unwrap()
+    );
+    (listener, endpoint)
+}
+
+#[tokio::test]
+async fn cdp_attaches_only_to_teams_and_passes_input_as_an_argument() {
+    let (listener, endpoint) = listener("test").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let call: Value = serde_json::from_str(&text).unwrap();
+            let result = match call["method"].as_str().unwrap() {
+                "Target.getTargets" => {
+                    json!({"targetInfos":[{"targetId":"unrelated","type":"page","url":"https://mail.example.test/"},{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})
+                }
+                "Target.attachToTarget" => {
+                    assert_eq!(call["params"]["targetId"], "teams");
+                    json!({"sessionId":"attached"})
+                }
+                "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
+                "Page.createIsolatedWorld" => json!({"executionContextId":42}),
+                "Runtime.evaluate" => {
+                    assert_eq!(call["params"]["contextId"], 42);
+                    assert_eq!(call["sessionId"], "attached");
+                    assert_eq!(call["params"]["returnByValue"], false);
+                    assert!(
+                        !call["params"]["expression"]
+                            .as_str()
+                            .unwrap()
+                            .contains("\"action\""),
+                        "input must not be interpolated into the installed source"
+                    );
+                    json!({"result":{"objectId":"bridge"}})
+                }
+                "Runtime.callFunctionOn" => {
+                    assert_eq!(call["params"]["objectId"], "bridge");
+                    assert_eq!(call["sessionId"], "attached");
+                    assert_eq!(call["params"]["arguments"][0]["value"]["action"], "status");
+                    json!({"result":{"value":{"ok":true,"profile":{"email":"test@example.test"},"capabilities":{"search":true}}}})
+                }
+                other => panic!("unexpected CDP method: {other}"),
+            };
+            reply(&mut ws, &call, result).await;
+        }
     });
+    let browser = browser(endpoint);
+    let result = browser.evaluate(json!({"action":"status"})).await.unwrap();
+    assert_eq!(result["profile"]["email"], "test@example.test");
+    drop(browser);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_clones_reuse_one_socket_target_session_and_installed_bridge() {
+    let (listener, endpoint) = listener("reuse").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        expect_sequence(&mut ws, &INSTALL).await;
+        expect_sequence(&mut ws, &["Target.getTargets", "Runtime.callFunctionOn"]).await;
+        expect_sequence(&mut ws, &["Target.getTargets", "Runtime.callFunctionOn"]).await;
+    });
+    let browser = browser(endpoint);
+    let clone = browser.clone();
+    for client in [&browser, &clone, &browser] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.evaluate(json!({"action":"status"})),
+        )
+        .await
+        .expect("later calls must reuse the attached page without reinstalling");
+        assert_eq!(result.unwrap()["ok"], true);
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_calls_share_the_socket_and_resolve_out_of_order() {
+    let (listener, endpoint) = listener("parallel").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        expect_sequence(&mut ws, &INSTALL).await;
+        let mut pending = Vec::new();
+        while pending.len() < 2 {
+            let call = receive_call(&mut ws).await;
+            match call["method"].as_str().unwrap() {
+                "Target.getTargets" => {
+                    reply(&mut ws, &call, standard_result("Target.getTargets")).await
+                }
+                "Runtime.callFunctionOn" => pending.push(call),
+                other => panic!("unexpected method: {other}"),
+            }
+        }
+        // Answer the second call first; each caller must receive its own result.
+        for call in pending.iter().rev() {
+            let marker = call["params"]["arguments"][0]["value"]["marker"].clone();
+            reply(
+                &mut ws,
+                call,
+                json!({"result":{"value":{"ok":true,"marker":marker}}}),
+            )
+            .await;
+        }
+    });
+    let browser = browser(endpoint);
+    browser.evaluate(json!({"action":"status"})).await.unwrap();
+    let (a, b) = tokio::join!(
+        browser.evaluate(json!({"action":"status","marker":"a"})),
+        browser.evaluate(json!({"action":"status","marker":"b"})),
+    );
+    assert_eq!(a.unwrap()["marker"], "a");
+    assert_eq!(b.unwrap()["marker"], "b");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_evaluation_ignores_its_late_response_and_keeps_the_socket() {
+    let (listener, endpoint) = listener("cancel").await;
+    let (started, pending) = tokio::sync::oneshot::channel();
+    let (cancelled, aborted) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut first = accept_async(socket).await.unwrap();
+        expect_sequence(&mut first, &INSTALL[..5]).await;
+        let stale = receive_call(&mut first).await;
+        assert_eq!(stale["method"], "Runtime.callFunctionOn");
+        started.send(()).unwrap();
+        aborted.await.unwrap();
+        reply(
+            &mut first,
+            &stale,
+            json!({"result":{"value":{"ok":true,"stale":true}}}),
+        )
+        .await;
+        expect_sequence(&mut first, &["Target.getTargets", "Runtime.callFunctionOn"]).await;
+    });
+    let browser = browser(endpoint);
     let first = browser.clone();
     let request = tokio::spawn(async move { first.evaluate(json!({"action":"status"})).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), pending)
@@ -243,6 +238,7 @@ async fn cancelled_evaluation_drops_pending_socket_before_the_next_call() {
         .unwrap();
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
+    cancelled.send(()).unwrap();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         browser.evaluate(json!({"action":"status"})),
@@ -250,7 +246,7 @@ async fn cancelled_evaluation_drops_pending_socket_before_the_next_call() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result["ok"], true);
+    assert_eq!(result, json!({"ok":true}));
     server.await.unwrap();
 }
 
@@ -267,7 +263,7 @@ async fn changed_port_file_invalidates_the_cached_browser_endpoint() {
     let first_server = tokio::spawn(async move {
         let (socket, _) = first.accept().await.unwrap();
         let mut socket = accept_async(socket).await.unwrap();
-        complete_evaluation(&mut socket).await;
+        expect_sequence(&mut socket, &INSTALL).await;
         assert!(
             !matches!(socket.next().await, Some(Ok(Message::Text(_)))),
             "old endpoint must be dropped before another operation"
@@ -275,7 +271,7 @@ async fn changed_port_file_invalidates_the_cached_browser_endpoint() {
     });
     let second_server = tokio::spawn(async move {
         let (socket, _) = second.accept().await.unwrap();
-        complete_evaluation(&mut accept_async(socket).await.unwrap()).await;
+        expect_sequence(&mut accept_async(socket).await.unwrap(), &INSTALL).await;
     });
     let browser = Browser::new(Config {
         auth_source: teams_mcp::config::AuthSource::Browser,
@@ -300,41 +296,19 @@ async fn changed_port_file_invalidates_the_cached_browser_endpoint() {
 }
 
 #[tokio::test]
-async fn failed_evaluation_detaches_the_target_then_invalidates_the_socket() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!(
-        "ws://{}/devtools/browser/error",
-        listener.local_addr().unwrap()
-    );
+async fn page_exception_detaches_and_the_next_call_reinstalls_on_the_same_socket() {
+    let (listener, endpoint) = listener("error").await;
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut first = accept_async(socket).await.unwrap();
-        for method in [
-            "Target.getTargets",
-            "Target.attachToTarget",
-            "Page.getFrameTree",
-            "Page.createIsolatedWorld",
-            "Runtime.evaluate",
-            "Target.detachFromTarget",
-        ] {
-            let call = receive_call(&mut first).await;
-            assert_eq!(call["method"], method);
-            let result = if method == "Runtime.evaluate" {
-                json!({"exceptionDetails":{}})
-            } else {
-                standard_result(method)
-            };
-            reply(&mut first, &call, result).await;
-        }
-        assert!(!matches!(first.next().await, Some(Ok(Message::Text(_)))));
-        let (socket, _) = listener.accept().await.unwrap();
-        complete_evaluation(&mut accept_async(socket).await.unwrap()).await;
+        let mut ws = accept_async(socket).await.unwrap();
+        expect_sequence(&mut ws, &INSTALL[..5]).await;
+        let call = receive_call(&mut ws).await;
+        assert_eq!(call["method"], "Runtime.callFunctionOn");
+        reply(&mut ws, &call, json!({"exceptionDetails":{}})).await;
+        expect_sequence(&mut ws, &["Target.detachFromTarget"]).await;
+        expect_sequence(&mut ws, &INSTALL).await;
     });
-    let browser = Browser::new(Config {
-        auth_source: teams_mcp::config::AuthSource::Browser,
-        cdp_url: Some(endpoint),
-        ..Default::default()
-    });
+    let browser = browser(endpoint);
     assert_eq!(
         browser
             .evaluate(json!({"action":"status"}))
@@ -355,12 +329,43 @@ async fn failed_evaluation_detaches_the_target_then_invalidates_the_socket() {
 }
 
 #[tokio::test]
+async fn destroyed_context_is_reinstalled_once_within_the_same_call() {
+    let (listener, endpoint) = listener("navigated").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        expect_sequence(&mut ws, &INSTALL).await;
+        expect_sequence(&mut ws, &["Target.getTargets"]).await;
+        let call = receive_call(&mut ws).await;
+        assert_eq!(call["method"], "Runtime.callFunctionOn");
+        ws.send(Message::Text(
+            json!({"id":call["id"],"error":{"code":-32000,"message":"Cannot find context with specified id"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        expect_sequence(
+            &mut ws,
+            &[
+                "Page.getFrameTree",
+                "Page.createIsolatedWorld",
+                "Runtime.evaluate",
+                "Runtime.callFunctionOn",
+            ],
+        )
+        .await;
+    });
+    let browser = browser(endpoint);
+    browser.evaluate(json!({"action":"status"})).await.unwrap();
+    let result = browser.evaluate(json!({"action":"status"})).await.unwrap();
+    assert_eq!(result["ok"], true);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn app_cdp_uses_its_explicit_endpoint_and_native_host_world() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!(
-        "ws://{}/devtools/browser/native",
-        listener.local_addr().unwrap()
-    );
+    let (listener, endpoint) = listener("native").await;
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(socket).await.unwrap();
@@ -374,23 +379,16 @@ async fn app_cdp_uses_its_explicit_endpoint_and_native_host_world() {
                 "Target.attachToTarget" => json!({"sessionId":"app-session"}),
                 "Runtime.evaluate" => {
                     assert!(call["params"].get("contextId").is_none());
-                    assert!(
-                        call["params"]["expression"]
-                            .as_str()
-                            .unwrap()
-                            .contains("\"nativeApp\":true")
-                    );
+                    json!({"result":{"objectId":"native-bridge"}})
+                }
+                "Runtime.callFunctionOn" => {
+                    assert_eq!(call["params"]["arguments"][0]["value"]["nativeApp"], true);
                     evaluated = true;
                     json!({"result":{"value":{"ok":true,"profile":{"id":"native-user"}}}})
                 }
-                "Target.detachFromTarget" => json!({}),
                 other => panic!("native app host bridge must stay in its main world, got {other}"),
             };
-            ws.send(Message::Text(
-                json!({"id":call["id"],"result":result}).to_string().into(),
-            ))
-            .await
-            .unwrap();
+            reply(&mut ws, &call, result).await;
         }
         assert!(evaluated);
     });
