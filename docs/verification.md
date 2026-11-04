@@ -29,9 +29,14 @@ during the cold start); the MCP server grew from 8.0 to 11.9 MiB with the HTTPS 
 and the first call took 5.4 s instead of 2.9 s. The session runs used the lease build
 before the hidden-tab option was added; the managed lease path is otherwise unchanged.
 
+Renewal soak with the default transport: one MCP session ran list, unread and search
+every three minutes for 31 minutes (11 cycles, 33 calls, zero failures). The first
+mint left the search token 29 minutes; when it entered the five-minute window, the
+next call started the browser, saw 4 minutes left, waited two seconds while Teams
+renewed it to 68 minutes, and succeeded in 4.5 s. Warm calls had an 841 ms median.
+
 Not run: the hidden-tab mode against the owner's own Chrome (it needs the owner's
-debugging approval and a Teams sign-in in that browser); token renewal after a real
-80-minute expiry (unit tests cover re-minting near expiry and after rejection).
+debugging approval and a Teams sign-in in that browser).
 
 ## Lightweight runtime update (branch `perf/lightweight-runtime`)
 
