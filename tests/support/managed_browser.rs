@@ -60,12 +60,18 @@ pub async fn run() {
                         let request:Value=serde_json::from_str(&text).unwrap();
                         let stop=request["method"]=="Browser.close";
                         let response=fs::read_to_string(profile.join("fixture-bridge-response")).ok().and_then(|text|serde_json::from_str::<Value>(&text).ok());
+                        let record=|name:&str,line:&str|{let _=writeln!(fs::OpenOptions::new().create(true).append(true).open(profile.join(name)).unwrap(),"{line}");};
+                        let cleared=profile.join("fixture-cache-cleared").exists();
                         let result=match request["method"].as_str() {
+                            Some("Page.setWebLifecycleState")=>{record("fixture-lifecycle",request["params"]["state"].as_str().unwrap_or(""));json!({})}
+                            Some("Storage.getUsageAndQuota")=>json!({"usage":1,"quota":1,"usageBreakdown":[{"storageType":"cache_storage","usage":if cleared {0} else {524_288_000}},{"storageType":"indexeddb","usage":1000}]}),
+                            Some("Storage.clearDataForOrigin")=>{record("fixture-cache-cleared",&format!("{} {}",request["params"]["origin"].as_str().unwrap_or(""),request["params"]["storageTypes"].as_str().unwrap_or("")));json!({})}
                             Some("Target.getTargets")=>json!({"targetInfos":response.as_ref().and_then(|value|value.get("_targets")).cloned().unwrap_or_else(||json!([{"targetId":"fixture-page","type":"page","url":"https://teams.microsoft.com/v2/"}]))}),
                             Some("Target.attachToTarget")=>json!({"sessionId":"fixture-session"}),
                             Some("Page.getFrameTree")=>json!({"frameTree":{"frame":{"id":"fixture-frame"}}}),
                             Some("Page.createIsolatedWorld")=>json!({"executionContextId":1}),
-                            Some("Runtime.evaluate")=>json!({"result":{"value":response.unwrap_or_else(||json!({"ok":false,"error":{"code":"ACCESS_DENIED","message":"Synthetic account access is restricted."}}))}}),
+                            Some("Runtime.evaluate")=>json!({"result":{"objectId":"fixture-bridge"}}),
+                            Some("Runtime.callFunctionOn")=>json!({"result":{"value":response.unwrap_or_else(||json!({"ok":false,"error":{"code":"ACCESS_DENIED","message":"Synthetic account access is restricted."}}))}}),
                             _=>json!({})};
                         ws.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).await.unwrap();
                         if stop {closed.notify_one();break;}

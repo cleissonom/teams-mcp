@@ -212,7 +212,7 @@ async fn simultaneous_clients_share_one_owned_headless_browser_and_stop_it_grace
 async fn explicit_login_is_headed_returns_before_signin_and_prevents_mode_conflicts() {
     let fixture = Fixture::new(false);
     let mut login = fixture.command();
-    login.args(["auth", "login"]);
+    login.args(["auth", "login", "--no-wait"]);
     let result = output(login).await;
     assert_eq!(result["success"], true);
     let args = fs::read_to_string(fixture.root.join("args")).unwrap();
@@ -234,7 +234,7 @@ async fn tenant_startup_uses_validated_selection_and_encodes_login_hint() {
     let fixture = Fixture::new(false);
     let mut login = fixture.command();
     login
-        .args(["auth", "login"])
+        .args(["auth", "login", "--no-wait"])
         .env("TEAMS_TENANT_ID", "22222222-2222-4222-8222-222222222222")
         .env("TEAMS_ACCOUNT", "guest+filter&name@example.test");
     assert_eq!(output(login).await["success"], true);
@@ -259,9 +259,10 @@ async fn stop_saves_only_successful_identity_selection_and_preserves_it_on_faile
     let selection = fixture.profile.join(".teams-mcp-selection.json");
     fs::write(fixture.profile.join("fixture-bridge-response"),json!({"ok":true,"profile":{"email":"guest+tag@example.test","tenantId":tenant,"id":"not-saved","displayName":"not-saved","token":"never-save"}}).to_string()).unwrap();
     let mut login = fixture.command();
-    login.args(["auth", "login"]);
+    login.args(["auth", "login", "--no-wait"]);
     assert_eq!(output(login).await["success"], true);
-    managed::stop(&fixture.config()).await.unwrap();
+    let stopped = managed::stop(&fixture.config()).await.unwrap();
+    assert_eq!(stopped["selectionSaved"], true);
     let saved = fs::read_to_string(&selection).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&saved).unwrap(),
@@ -286,9 +287,12 @@ async fn stop_saves_only_successful_identity_selection_and_preserves_it_on_faile
         )
         .unwrap();
         let mut login = fixture.command();
-        login.args(["auth", "login"]);
+        login.args(["auth", "login", "--no-wait"]);
         assert_eq!(output(login).await["success"], true);
-        managed::stop(&fixture.config()).await.unwrap();
+        assert_eq!(
+            managed::stop(&fixture.config()).await.unwrap()["selectionSaved"],
+            false
+        );
         assert_eq!(fs::read_to_string(&selection).unwrap(), saved);
     }
     let args = fs::read_to_string(fixture.root.join("args")).unwrap();
@@ -301,6 +305,123 @@ async fn stop_saves_only_successful_identity_selection_and_preserves_it_on_faile
         url.query_pairs()
             .any(|(key, value)| key == "login_hint" && value == "guest+tag@example.test")
     );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn login_waits_for_signin_then_saves_the_account_and_closes_the_window() {
+    let fixture = Fixture::new(false);
+    let tenant = "22222222-2222-4222-8222-222222222222";
+    fs::create_dir_all(&fixture.profile).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fixture.profile, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        fixture.profile.join("fixture-bridge-response"),
+        json!({"ok":true,"profile":{"email":"guest@example.test","tenantId":tenant}}).to_string(),
+    )
+    .unwrap();
+    let mut login = fixture.command();
+    login
+        .args(["auth", "login"])
+        .stdin(std::process::Stdio::null());
+    let result = output(login).await;
+    assert_eq!(result["signedIn"], true);
+    assert_eq!(result["account"], "guest@example.test");
+    assert_eq!(result["selectionSaved"], true);
+    assert_eq!(result["stopped"], true);
+    assert!(fixture.profile.join("fixture-closed-gracefully").exists());
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(fixture.profile.join(".teams-mcp-selection.json")).unwrap()
+        )
+        .unwrap(),
+        json!({"email":"guest@example.test","tenant":tenant})
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn offline_status_reports_state_without_launching_a_browser() {
+    let fixture = Fixture::new(true);
+    let mut status = fixture.command();
+    status.args(["auth", "status"]);
+    let result = output(status).await;
+    assert_eq!(result["setupComplete"], true);
+    assert_eq!(result["browser"]["state"], "stopped");
+    assert!(
+        !fixture.root.join("args").exists(),
+        "status must not start Chrome"
+    );
+    let mut call = fixture.command();
+    call.arg("--status");
+    assert_eq!(output(call).await["error"]["code"], "ACCESS_DENIED");
+    let mut status = fixture.command();
+    status.args(["auth", "status"]);
+    let result = output(status).await;
+    assert_eq!(result["browser"]["state"], "running");
+    assert_eq!(result["browser"]["mode"], "headless");
+    assert_eq!(result["browser"]["stopsAfterIdleSeconds"], 300);
+    assert_eq!(result["browser"]["freezesAfterIdleSeconds"], 15);
+    managed::stop(&fixture.config()).await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn idle_page_is_frozen_and_the_next_call_makes_it_active_again() {
+    let fixture = Fixture::new(true);
+    let lifecycle = fixture.profile.join("fixture-lifecycle");
+    let mut call = fixture.command();
+    call.arg("--status").env("TEAMS_BROWSER_FREEZE_SECS", "5");
+    assert_eq!(output(call).await["error"]["code"], "ACCESS_DENIED");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while !fs::read_to_string(&lifecycle)
+        .unwrap_or_default()
+        .contains("frozen")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle page was not frozen"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut status = fixture.command();
+    status.args(["auth", "status"]);
+    assert_eq!(output(status).await["browser"]["frozen"], true);
+    let mut call = fixture.command();
+    call.arg("--status");
+    assert_eq!(output(call).await["error"]["code"], "ACCESS_DENIED");
+    let states = fs::read_to_string(&lifecycle).unwrap();
+    assert!(states.trim_end().ends_with("active"), "{states}");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut status = fixture.command();
+    status.args(["auth", "status"]);
+    assert_eq!(output(status).await["browser"]["frozen"], false);
+    managed::stop(&fixture.config()).await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn compact_clears_only_teams_cache_storage_through_chrome() {
+    let fixture = Fixture::new(true);
+    let mut compact = fixture.command();
+    compact.args(["auth", "compact"]);
+    let result = output(compact).await;
+    assert_eq!(result["compacted"], true);
+    assert_eq!(result["cacheStorageBeforeMiB"], 1000.0);
+    assert_eq!(result["cacheStorageAfterMiB"], 0.0);
+    let cleared = fs::read_to_string(fixture.profile.join("fixture-cache-cleared")).unwrap();
+    assert_eq!(
+        cleared.lines().collect::<Vec<_>>(),
+        [
+            "https://teams.microsoft.com cache_storage",
+            "https://teams.cloud.microsoft cache_storage"
+        ]
+    );
+    assert!(
+        fixture.profile.join("Default").is_dir(),
+        "sign-in profile must remain"
+    );
+    managed::stop(&fixture.config()).await.unwrap();
 }
 
 #[tokio::test]

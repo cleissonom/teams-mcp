@@ -1,28 +1,41 @@
 use crate::{
-    cdp::Cdp,
-    config::{Config, endpoint_from_port_file},
+    cdp::{Cdp, select_target},
+    config::{BrowserKind, Config, endpoint_from_port_file},
     error::Failure,
 };
-use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     env, fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     process::{Child, Command},
+    sync::oneshot,
     time::{sleep, timeout},
 };
 mod restore;
 mod selection;
 mod state;
 use state::{
-    ERROR, HEARTBEAT, Running, START_TIMEOUT, STATE, STOP, State, lock_file, modified,
-    private_directory, profile, read_small, running, startup_lock, validate_private_profile,
-    worker_stopped, write_private,
+    ERROR, FROZEN, HEARTBEAT, Running, START_TIMEOUT, STATE, STOP, State, idle_seconds, lock_file,
+    log_event, modified, private_directory, profile, profile_in_use, read_small, running,
+    startup_lock, validate_private_profile, worker_stopped, write_private,
 };
+
+const TEAMS_ORIGINS: [&str; 2] = [
+    "https://teams.microsoft.com",
+    "https://teams.cloud.microsoft",
+];
+/// Interactive setup windows close after this much connector inactivity.
+const SETUP_IDLE: Duration = Duration::from_secs(900);
+const LOGIN_WAIT: Duration = Duration::from_secs(900);
+/// Chrome features that download models or run services Teams does not use. Security
+/// components (Safe Browsing, certificate and CT updates) are deliberately left enabled.
+const DISABLED_FEATURES: &str = "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OptimizationHints,Translate,MediaRouter";
 
 pub fn session_config(config: &Config) -> Result<Config, Failure> {
     selection::effective(config)
@@ -38,14 +51,99 @@ pub async fn endpoint(config: &Config) -> Result<String, Failure> {
     Ok(ensure(&config, &profile, false).await?.endpoint)
 }
 
-pub async fn login(config: &Config) -> Result<Value, Failure> {
+/// Records tool activity so the supervisor neither freezes nor stops a browser in use.
+pub fn keepalive(config: &Config) -> Result<(), Failure> {
+    let profile = profile(config)?;
+    if !profile.is_dir() {
+        return Ok(());
+    }
+    if let Running::Ready(state) = running(&profile)? {
+        write_private(&profile.join(HEARTBEAT), state.nonce.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub async fn login(config: &Config, wait: bool) -> Result<Value, Failure> {
     let config = session_config(config)?;
     let profile = profile(&config)?;
     private_directory(&profile)?;
-    ensure(&config, &profile, true).await?;
+    let state = ensure(&config, &profile, true).await?;
+    if !wait {
+        return Ok(
+            json!({"started":true,"mode":"headed","message":"Complete normal Teams sign-in in the opened browser, then run teams-mcp auth stop. Ordinary calls will reuse this profile headlessly."}),
+        );
+    }
+    eprintln!(
+        "Complete normal Teams sign-in in the opened browser window. Waiting up to 15 minutes."
+    );
+    let (email, tenant) = await_signin(&config, &profile, &state).await?;
+    let saved = selection::save(&profile, email.clone(), tenant.clone());
+    let _startup = startup_lock(&profile).await?;
+    stop_worker(&profile, &state).await?;
     Ok(
-        json!({"started":true,"mode":"headed","message":"Complete normal Teams sign-in in the opened browser, then run teams-mcp auth stop. Ordinary calls will reuse this profile headlessly."}),
+        json!({"signedIn":true,"account":email,"tenant":tenant,"selectionSaved":saved,"stopped":true}),
     )
+}
+
+/// Polls the headed setup browser until it is signed in. On a terminal, the owner
+/// confirms with Enter, so a guest can first switch to the intended organization.
+async fn await_signin(
+    config: &Config,
+    profile: &Path,
+    state: &State,
+) -> Result<(String, String), Failure> {
+    let interactive = std::io::stdin().is_terminal();
+    let deadline = Instant::now() + LOGIN_WAIT;
+    let mut announced = None;
+    let mut enter = interactive.then(read_line);
+    loop {
+        if worker_stopped(profile)? {
+            return Err(failure("AUTH_LOGIN_CLOSED"));
+        }
+        write_private(&profile.join(HEARTBEAT), state.nonce.as_bytes())?;
+        let identity = selection::identity(config, &state.endpoint).await;
+        let pressed = enter
+            .as_mut()
+            .is_some_and(|receiver| receiver.try_recv().is_ok());
+        match (&identity, interactive, pressed) {
+            (Some(current), false, _) | (Some(current), true, true) => return Ok(current.clone()),
+            (None, true, true) => {
+                eprintln!("Sign-in is not complete yet. Finish it in the browser window first.");
+            }
+            _ => {}
+        }
+        if pressed {
+            enter = Some(read_line());
+        }
+        if let Some(current) = identity
+            && announced.as_ref() != Some(&current)
+        {
+            eprintln!(
+                "Signed in as {} (tenant {}). Switch organization in the browser window if needed, then press Enter to save and close it.",
+                current.0, current.1
+            );
+            announced = Some(current);
+        }
+        if Instant::now() >= deadline {
+            return Err(failure("AUTH_LOGIN_TIMEOUT"));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn read_line() -> oneshot::Receiver<()> {
+    let (sender, receiver) = oneshot::channel();
+    // A detached thread: a pending terminal read must not delay process exit.
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin()
+            .read_line(&mut line)
+            .is_ok_and(|read| read > 0)
+        {
+            let _ = sender.send(());
+        }
+    });
+    receiver
 }
 
 pub async fn stop(config: &Config) -> Result<Value, Failure> {
@@ -59,18 +157,133 @@ pub async fn stop(config: &Config) -> Result<Value, Failure> {
         Running::Stopped => return Ok(json!({"stopped":false})),
         Running::Starting => return Err(failure("BROWSER_BUSY")),
     };
-    selection::persist(config, &profile, &state.endpoint).await;
+    let saved = selection::persist(config, &profile, &state.endpoint).await;
+    stop_worker(&profile, &state).await?;
+    Ok(json!({"stopped":true,"selectionSaved":saved}))
+}
+
+async fn stop_worker(profile: &Path, state: &State) -> Result<(), Failure> {
     write_private(&profile.join(STOP), state.nonce.as_bytes())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if worker_stopped(&profile)? {
-            return Ok(json!({"stopped":true}));
+        if worker_stopped(profile)? {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(failure("BROWSER_STOP_TIMEOUT"));
         }
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Local diagnostics only: never starts Chrome or contacts Teams.
+pub fn status(config: &Config) -> Result<Value, Failure> {
+    let config = session_config(config)?;
+    let profile = profile(&config)?;
+    validate_private_profile(&profile)?;
+    let mut browser = json!({"state":"stopped"});
+    if profile.is_dir() {
+        match running(&profile)? {
+            Running::Stopped => {}
+            Running::Starting => browser = json!({"state":"starting"}),
+            Running::Ready(state) => {
+                let frozen =
+                    read_small(&profile.join(FROZEN))?.as_deref() == Some(state.nonce.as_str());
+                let stops = if state.headed {
+                    SETUP_IDLE.as_secs()
+                } else {
+                    state.idle_secs
+                };
+                browser = json!({"state":"running","mode":if state.headed {"headed"} else {"headless"},
+                    "frozen":frozen,"idleSeconds":idle_seconds(&profile),"stopsAfterIdleSeconds":stops,
+                    "freezesAfterIdleSeconds":state.freeze_secs.filter(|_| !state.headed)});
+            }
+        }
+    }
+    Ok(
+        json!({"setupComplete":profile.join("Default").is_dir(),"account":config.account,
+        "tenant":config.tenant,"profile":profile.display().to_string(),"browser":browser}),
+    )
+}
+
+/// Clears only the Teams Service Worker cache through Chrome. Cookies, local storage
+/// and IndexedDB (where the sign-in lives) are untouched.
+pub async fn compact(config: &Config) -> Result<Value, Failure> {
+    let endpoint = endpoint(config).await?;
+    let cdp = Cdp::connect(&endpoint).await?;
+    let session = teams_page_session(&cdp, config.target_id.as_deref()).await?;
+    let result = async {
+        let before = cache_storage_bytes(&cdp, &session).await?;
+        clear_cache_storage(&cdp, &session).await?;
+        let after = cache_storage_bytes(&cdp, &session).await?;
+        Ok::<_, Failure>((before, after))
+    }
+    .await;
+    let _ = cdp
+        .call(
+            "Target.detachFromTarget",
+            json!({"sessionId":session}),
+            None,
+        )
+        .await;
+    let (before, after) = result?;
+    let mib = |bytes: u64| (bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0;
+    Ok(
+        json!({"compacted":true,"cacheStorageBeforeMiB":mib(before),"cacheStorageAfterMiB":mib(after),
+        "message":"Cleared Teams' Service Worker cache only. Sign-in data was kept; the next cold start downloads Teams files again."}),
+    )
+}
+
+/// Chrome's Storage domain answers only on a page session, so storage calls attach to the Teams page.
+async fn teams_page_session(cdp: &Cdp, selected: Option<&str>) -> Result<String, Failure> {
+    let targets = cdp.call("Target.getTargets", json!({}), None).await?;
+    let target = select_target(&targets, selected)?;
+    let attached = cdp
+        .call(
+            "Target.attachToTarget",
+            json!({"targetId":target,"flatten":true}),
+            None,
+        )
+        .await?;
+    attached["sessionId"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| failure("BROWSER_COMPACT_FAILED"))
+}
+
+async fn cache_storage_bytes(cdp: &Cdp, session: &str) -> Result<u64, Failure> {
+    let mut total = 0;
+    for origin in TEAMS_ORIGINS {
+        let usage = cdp
+            .call(
+                "Storage.getUsageAndQuota",
+                json!({"origin":origin}),
+                Some(session),
+            )
+            .await
+            .map_err(|_| failure("BROWSER_COMPACT_FAILED"))?;
+        total += usage["usageBreakdown"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["storageType"] == "cache_storage")
+            .filter_map(|entry| entry["usage"].as_f64())
+            .sum::<f64>() as u64;
+    }
+    Ok(total)
+}
+
+async fn clear_cache_storage(cdp: &Cdp, session: &str) -> Result<(), Failure> {
+    for origin in TEAMS_ORIGINS {
+        cdp.call(
+            "Storage.clearDataForOrigin",
+            json!({"origin":origin,"storageTypes":"cache_storage"}),
+            Some(session),
+        )
+        .await
+        .map_err(|_| failure("BROWSER_COMPACT_FAILED"))?;
+    }
+    Ok(())
 }
 
 async fn ensure(config: &Config, profile: &Path, headed: bool) -> Result<State, Failure> {
@@ -80,7 +293,7 @@ async fn ensure(config: &Config, profile: &Path, headed: bool) -> Result<State, 
         Running::Starting => return wait_ready(profile, headed).await,
         Running::Stopped => {}
     }
-    if fs::symlink_metadata(profile.join("SingletonLock")).is_ok() {
+    if profile_in_use(profile) {
         return Err(failure("BROWSER_PROFILE_IN_USE"));
     }
     let binary = browser_binary(config)?;
@@ -175,6 +388,7 @@ pub async fn worker(config: &Config, headed: bool) -> Result<(), Failure> {
     private_directory(&profile)?;
     let result = run_worker(&config, &profile, headed).await;
     if let Err(error) = &result {
+        log_event(&profile, config.log, &format!("error code={}", error.code));
         let _ = write_private(
             &profile.join(ERROR),
             json!({"code":error.code}).to_string().as_bytes(),
@@ -186,25 +400,30 @@ pub async fn worker(config: &Config, headed: bool) -> Result<(), Failure> {
 async fn run_worker(config: &Config, profile: &Path, headed: bool) -> Result<(), Failure> {
     let mut shutdown = Shutdown::new()?;
     let ownership = lock_file(&profile.join(".teams-mcp-worker.lock"))?;
-    ownership
-        .try_lock_exclusive()
-        .map_err(|_| failure("BROWSER_BUSY"))?;
+    ownership.try_lock().map_err(|_| failure("BROWSER_BUSY"))?;
     // A newly owned worker must not advertise a previous worker's endpoint while starting.
-    for name in [STATE, HEARTBEAT, STOP] {
+    for name in [STATE, HEARTBEAT, STOP, FROZEN] {
         match fs::remove_file(profile.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(failure("BROWSER_STATE_INVALID")),
         }
     }
-    if fs::symlink_metadata(profile.join("SingletonLock")).is_ok() {
+    if profile_in_use(profile) {
         return Err(failure("BROWSER_PROFILE_IN_USE"));
     }
+    let started = Instant::now();
+    log_event(
+        profile,
+        config.log,
+        &format!("start headed={headed} lean={}", config.lean),
+    );
     let previous = read_small(&profile.join("DevToolsActivePort"))?;
     let mut child = chrome_command(
         &browser_binary(config)?,
         profile,
         headed,
+        config.lean,
         &selection::startup_url(config)?,
     )
     .spawn()
@@ -222,25 +441,31 @@ async fn run_worker(config: &Config, profile: &Path, headed: bool) -> Result<(),
         if !headed {
             restore::prepare(&endpoint, &selection::startup_url(config)?).await?;
         }
-        state::publish(profile, endpoint, headed).map(Some)
+        state::publish(profile, endpoint, headed, config.idle, config.freeze).map(Some)
     }
     .await;
     if let Ok(Some(state)) = &startup {
-        supervise(profile, state, &mut child, &mut shutdown).await;
+        log_event(
+            profile,
+            config.log,
+            &format!("ready ms={}", started.elapsed().as_millis()),
+        );
+        supervise(config, profile, state, &mut child, &mut shutdown).await;
     }
     if let Some(endpoint) = known_endpoint {
-        close_owned(&endpoint, &mut child).await;
+        close_owned(config, profile, &endpoint, &mut child).await;
     } else {
         terminate_owned(&mut child).await;
     }
-    for name in [STATE, HEARTBEAT, STOP, ERROR] {
+    for name in [STATE, HEARTBEAT, STOP, ERROR, FROZEN] {
         let _ = fs::remove_file(profile.join(name));
     }
+    log_event(profile, config.log, "exit");
     drop(ownership);
     startup.map(|_| ())
 }
 
-fn chrome_command(binary: &Path, profile: &Path, headed: bool, url: &str) -> Command {
+fn chrome_command(binary: &Path, profile: &Path, headed: bool, lean: bool, url: &str) -> Command {
     let mut command = Command::new(binary);
     command
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -249,9 +474,18 @@ fn chrome_command(binary: &Path, profile: &Path, headed: bool, url: &str) -> Com
             "--remote-debugging-port=0",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-sync",
+            DISABLED_FEATURES,
         ]);
     if !headed {
-        command.args(["--headless=new", "--restore-last-session"]);
+        command.args(["--headless=new", "--restore-last-session", "--mute-audio"]);
+        if lean {
+            // Opt-in: skip image decoding and drop Microsoft telemetry hosts in the hidden page.
+            command.args([
+                "--blink-settings=imagesEnabled=false",
+                "--host-resolver-rules=MAP *.events.data.microsoft.com ~NOTFOUND, MAP *.aria.microsoft.com ~NOTFOUND",
+            ]);
+        }
     } else {
         command.arg(url);
     }
@@ -290,10 +524,30 @@ async fn fresh_endpoint(
     }
 }
 
-async fn supervise(profile: &Path, state: &State, child: &mut Child, shutdown: &mut Shutdown) {
-    let idle = Duration::from_secs(if state.headed { 900 } else { 300 });
+async fn supervise(
+    config: &Config,
+    profile: &Path,
+    state: &State,
+    child: &mut Child,
+    shutdown: &mut Shutdown,
+) {
+    let idle = if state.headed {
+        SETUP_IDLE
+    } else {
+        config.idle
+    };
+    let freeze_after = config.freeze.filter(|_| !state.headed);
+    let mut freezer = Freezer::default();
+    let mut retry_freeze = Instant::now();
     let mut last_use = Instant::now();
     let mut seen = modified(&profile.join(HEARTBEAT));
+    let active = |profile: &Path| {
+        read_small(&profile.join(HEARTBEAT))
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(&state.nonce)
+    };
     loop {
         if read_small(&profile.join(STOP)).ok().flatten().as_deref() == Some(&state.nonce)
             || child.try_wait().ok().flatten().is_some()
@@ -301,31 +555,151 @@ async fn supervise(profile: &Path, state: &State, child: &mut Child, shutdown: &
             break;
         }
         let current = modified(&profile.join(HEARTBEAT));
-        if current != seen
-            && read_small(&profile.join(HEARTBEAT))
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(&state.nonce)
-        {
+        if current != seen && active(profile) {
             seen = current;
             last_use = Instant::now();
+            if freezer.frozen {
+                // A client made the page active before calling it.
+                freezer.frozen = false;
+                let _ = fs::remove_file(profile.join(FROZEN));
+                log_event(profile, config.log, "active");
+            }
         }
         if last_use.elapsed() >= idle {
+            log_event(profile, config.log, "idle-stop");
             break;
+        }
+        if let Some(after) = freeze_after
+            && !freezer.frozen
+            && last_use.elapsed() >= after
+            && Instant::now() >= retry_freeze
+            // Recheck activity immediately before freezing; clients also re-activate while running.
+            && modified(&profile.join(HEARTBEAT)) == seen
+        {
+            match freezer
+                .freeze(&state.endpoint, config.target_id.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    let _ = write_private(&profile.join(FROZEN), state.nonce.as_bytes());
+                    log_event(profile, config.log, "frozen");
+                }
+                Err(error) => {
+                    retry_freeze = Instant::now() + Duration::from_secs(30);
+                    log_event(
+                        profile,
+                        config.log,
+                        &format!("freeze-skipped code={}", error.code),
+                    );
+                }
+            }
         }
         tokio::select! { _=sleep(Duration::from_secs(1))=>{}, _=shutdown.wait()=>break }
     }
 }
 
-async fn close_owned(endpoint: &str, child: &mut Child) {
-    let _ = timeout(Duration::from_secs(3), async {
-        let mut cdp = Cdp::connect(endpoint).await?;
+/// Keeps one supervisor CDP session attached to the managed Teams page while it is frozen.
+#[derive(Default)]
+struct Freezer {
+    cdp: Option<Arc<Cdp>>,
+    page: Option<(String, String)>,
+    frozen: bool,
+}
+
+impl Freezer {
+    async fn freeze(&mut self, endpoint: &str, selected: Option<&str>) -> Result<(), Failure> {
+        let result = timeout(
+            Duration::from_secs(5),
+            self.freeze_inner(endpoint, selected),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                self.frozen = true;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.page = None;
+                Err(error)
+            }
+            Err(_) => {
+                self.page = None;
+                Err(failure("BROWSER_FREEZE_FAILED"))
+            }
+        }
+    }
+
+    async fn freeze_inner(
+        &mut self,
+        endpoint: &str,
+        selected: Option<&str>,
+    ) -> Result<(), Failure> {
+        if !self.cdp.as_ref().is_some_and(|cdp| cdp.is_open()) {
+            self.cdp = Some(Cdp::connect(endpoint).await?);
+            self.page = None;
+        }
+        let cdp = self
+            .cdp
+            .clone()
+            .ok_or_else(|| failure("BROWSER_FREEZE_FAILED"))?;
+        let targets = cdp.call("Target.getTargets", json!({}), None).await?;
+        let target = select_target(&targets, selected)?;
+        let session = match &self.page {
+            Some((attached, session)) if *attached == target => session.clone(),
+            _ => {
+                let attached = cdp
+                    .call(
+                        "Target.attachToTarget",
+                        json!({"targetId":target,"flatten":true}),
+                        None,
+                    )
+                    .await?;
+                let session = attached["sessionId"]
+                    .as_str()
+                    .ok_or_else(|| failure("BROWSER_FREEZE_FAILED"))?
+                    .to_owned();
+                self.page = Some((target, session.clone()));
+                session
+            }
+        };
+        cdp.call(
+            "Page.setWebLifecycleState",
+            json!({"state":"frozen"}),
+            Some(&session),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+async fn close_owned(config: &Config, profile: &Path, endpoint: &str, child: &mut Child) {
+    let _ = timeout(Duration::from_secs(6), async {
+        let cdp = Cdp::connect(endpoint).await?;
+        if let Some(limit) = config.cache_limit_mb {
+            trim_cache(&cdp, limit, config, profile).await;
+        }
         cdp.call("Browser.close", json!({}), None).await
     })
     .await;
     if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+/// Clears Teams' Service Worker cache at shutdown once it exceeds the configured limit.
+async fn trim_cache(cdp: &Cdp, limit_mb: u64, config: &Config, profile: &Path) {
+    let Ok(session) = teams_page_session(cdp, config.target_id.as_deref()).await else {
+        return;
+    };
+    if let Ok(bytes) = cache_storage_bytes(cdp, &session).await
+        && bytes > limit_mb * 1_048_576
+        && clear_cache_storage(cdp, &session).await.is_ok()
+    {
+        log_event(
+            profile,
+            config.log,
+            &format!("cache-trim mib={}", bytes / 1_048_576),
+        );
     }
 }
 
@@ -348,26 +722,67 @@ async fn terminate_owned(child: &mut Child) {
     }
 }
 
+/// Installed Chromium browsers in preference order: Chrome, Edge, Chromium, Brave.
+fn browser_candidates(kind: Option<BrowserKind>) -> Vec<PathBuf> {
+    use BrowserKind::*;
+    let wanted = |candidate: BrowserKind| kind.is_none_or(|kind| kind == candidate);
+    let mut paths = Vec::new();
+    if cfg!(target_os = "macos") {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        for (candidate, app) in [
+            (Chrome, "Google Chrome.app/Contents/MacOS/Google Chrome"),
+            (Edge, "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            (Chromium, "Chromium.app/Contents/MacOS/Chromium"),
+            (Brave, "Brave Browser.app/Contents/MacOS/Brave Browser"),
+        ] {
+            if wanted(candidate) {
+                paths.push(Path::new("/Applications").join(app));
+                paths.extend(home.iter().map(|home| home.join("Applications").join(app)));
+            }
+        }
+    } else if cfg!(windows) {
+        let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(|name| env::var_os(name).map(PathBuf::from))
+            .collect();
+        for (candidate, executable) in [
+            (Chrome, "Google/Chrome/Application/chrome.exe"),
+            (Edge, "Microsoft/Edge/Application/msedge.exe"),
+            (Chromium, "Chromium/Application/chrome.exe"),
+            (Brave, "BraveSoftware/Brave-Browser/Application/brave.exe"),
+        ] {
+            if wanted(candidate) {
+                paths.extend(roots.iter().map(|root| root.join(executable)));
+            }
+        }
+    } else {
+        let mut directories: Vec<PathBuf> = env::var_os("PATH")
+            .map(|path| env::split_paths(&path).collect())
+            .unwrap_or_default();
+        directories.extend(["/usr/bin", "/snap/bin"].map(PathBuf::from));
+        for (candidate, names) in [
+            (Chrome, &["google-chrome", "google-chrome-stable"][..]),
+            (Edge, &["microsoft-edge", "microsoft-edge-stable"][..]),
+            (Chromium, &["chromium", "chromium-browser"][..]),
+            (Brave, &["brave-browser", "brave"][..]),
+        ] {
+            if wanted(candidate) {
+                for name in names {
+                    paths.extend(directories.iter().map(|directory| directory.join(name)));
+                }
+            }
+        }
+    }
+    paths
+}
+
 fn browser_binary(config: &Config) -> Result<PathBuf, Failure> {
     let binary = config
         .browser_binary
         .clone()
         .or_else(|| {
-            let candidates = if cfg!(target_os = "macos") {
-                vec!["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
-            } else if cfg!(target_os = "linux") {
-                vec![
-                    "/usr/bin/google-chrome",
-                    "/usr/bin/google-chrome-stable",
-                    "/usr/bin/chromium",
-                    "/usr/bin/chromium-browser",
-                ]
-            } else {
-                vec![]
-            };
-            candidates
+            browser_candidates(config.browser)
                 .into_iter()
-                .map(PathBuf::from)
                 .find(|path| path.is_file())
         })
         .ok_or_else(|| failure("BROWSER_NOT_FOUND"))?;
@@ -428,7 +843,7 @@ fn failure(code: &str) -> Failure {
         ),
         "BROWSER_NOT_FOUND" => (
             code,
-            "Install Google Chrome or set TEAMS_BROWSER_BINARY to its absolute executable path.",
+            "Install Google Chrome, Microsoft Edge, Chromium or Brave, or set TEAMS_BROWSER_BINARY to its absolute executable path.",
         ),
         "BROWSER_INVALID_CONFIGURATION" => (
             code,
@@ -453,6 +868,22 @@ fn failure(code: &str) -> Failure {
         "BROWSER_STOP_TIMEOUT" => (
             code,
             "The owned browser did not stop within ten seconds. Retry teams-mcp auth stop.",
+        ),
+        "AUTH_LOGIN_TIMEOUT" => (
+            code,
+            "Sign-in did not complete within 15 minutes. The setup window was left open; finish sign-in, then run teams-mcp auth stop.",
+        ),
+        "AUTH_LOGIN_CLOSED" => (
+            code,
+            "The setup browser closed before sign-in completed. Run teams-mcp auth login again.",
+        ),
+        "BROWSER_FREEZE_FAILED" => (
+            code,
+            "The idle Teams page could not be frozen; it keeps running until idle shutdown.",
+        ),
+        "BROWSER_COMPACT_FAILED" => (
+            code,
+            "Chrome could not report or clear the Teams cache. No sign-in data was changed; retry later.",
         ),
         _ => (
             "BROWSER_START_FAILED",
@@ -494,5 +925,73 @@ mod tests {
                 assert_eq!(value, expected);
             }
         }
+    }
+
+    #[test]
+    fn lean_mode_is_opt_in_and_never_weakens_browser_security() {
+        for (headed, lean) in [(false, false), (false, true), (true, true)] {
+            let command = chrome_command(
+                Path::new("/fixture/chrome"),
+                Path::new("/fixture/profile"),
+                headed,
+                lean,
+                "https://teams.microsoft.com/v2/",
+            );
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .filter_map(|arg| arg.to_str())
+                .collect();
+            assert!(args.contains(&"--disable-sync"));
+            assert_eq!(
+                args.iter().any(|arg| arg.starts_with("--blink-settings")),
+                lean && !headed
+            );
+            for weakening in [
+                "--no-sandbox",
+                "--disable-web-security",
+                "--disable-component-update",
+                "--disable-background-networking",
+                "--disable-extensions",
+            ] {
+                assert!(!args.contains(&weakening), "{weakening}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_a_dead_same_host_singleton_lock_is_treated_as_stale() {
+        let profile = std::env::temp_dir().join(format!("teams-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&profile).unwrap();
+        let lock = profile.join("SingletonLock");
+        assert!(!profile_in_use(&profile));
+        let host = state_hostname();
+        for (target, in_use) in [
+            (format!("{host}-{}", std::process::id()), true),
+            (format!("{host}-999999"), false),
+            ("other-host.invalid-999999".to_owned(), true),
+            ("unparseable".to_owned(), true),
+        ] {
+            let _ = fs::remove_file(&lock);
+            std::os::unix::fs::symlink(&target, &lock).unwrap();
+            assert_eq!(profile_in_use(&profile), in_use, "{target}");
+            assert!(
+                fs::symlink_metadata(&lock).is_ok(),
+                "lock must be preserved"
+            );
+        }
+        fs::remove_file(&lock).unwrap();
+        fs::write(&lock, "regular file").unwrap();
+        assert!(profile_in_use(&profile));
+        fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn state_hostname() -> String {
+        let output = std::process::Command::new("/bin/hostname")
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 }

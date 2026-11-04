@@ -2,12 +2,20 @@ use crate::{
     config::{AuthSource, Config, is_teams_page},
     error::Failure,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
 use tokio_tungstenite::{
@@ -16,6 +24,7 @@ use tokio_tungstenite::{
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, Failure>>>>>;
 
 #[cfg(not(test))]
 const READINESS_WAIT: Duration = Duration::from_secs(30);
@@ -25,18 +34,36 @@ const READINESS_WAIT: Duration = Duration::from_millis(500);
 const READINESS_POLL: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const READINESS_POLL: Duration = Duration::from_millis(10);
+/// Keeps a managed call's lease fresh and its page active while the bridge runs.
+const LEASE_INTERVAL: Duration = Duration::from_secs(2);
+/// Calls the bridge function installed once per execution context.
+const CALL_BRIDGE: &str = "function(input) { return this(input); }";
 
 #[derive(Clone)]
 pub struct Browser {
     config: Config,
-    connection: Arc<Mutex<Option<Cdp>>>,
+    shared: Arc<Mutex<Shared>>,
+}
+
+#[derive(Default)]
+struct Shared {
+    cdp: Option<Arc<Cdp>>,
+    page: Option<Page>,
+}
+
+/// A target session that stays attached across calls, with its installed bridge function.
+#[derive(Clone)]
+struct Page {
+    target: String,
+    session: String,
+    bridge: Option<String>,
 }
 
 impl Browser {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            connection: Arc::new(Mutex::new(None)),
+            shared: Arc::default(),
         }
     }
 
@@ -49,22 +76,52 @@ impl Browser {
         input["expectedAccount"] = json!(config.account);
         input["tenantId"] = json!(config.tenant);
         input["nativeApp"] = json!(self.config.auth_source == AuthSource::App);
-        timeout(Duration::from_secs(65), self.evaluate_inner(input))
+        let limit = self.config.request_timeout;
+        timeout(limit, self.evaluate_inner(input))
             .await
             .map_err(|_| {
                 Failure::new(
                     "BROWSER_TIMEOUT",
-                    "Teams did not respond within 65 seconds. Check the open Teams page and retry.",
+                    &format!(
+                        "Teams did not respond within {} seconds. Check the open Teams page and retry.",
+                        limit.as_secs()
+                    ),
                 )
             })?
     }
 
+    fn managed(&self) -> bool {
+        self.config.auth_source == AuthSource::Headless
+    }
+
     async fn evaluate_inner(&self, input: Value) -> Result<Value, Failure> {
-        let mut connection = self.connection.lock().await;
-        // Taking ownership ensures a cancelled or timed-out operation drops the socket,
-        // rather than caching a connection with an unread response still pending.
-        let previous = connection.take();
-        let endpoint = if self.config.auth_source == AuthSource::Headless {
+        let cdp = self.connection().await?;
+        let result = if self.managed() {
+            self.evaluate_managed(&cdp, input).await
+        } else {
+            match cdp.call("Target.getTargets", json!({}), None).await {
+                Ok(targets) => match select_target(&targets, self.config.target_id.as_deref()) {
+                    Ok(target) => self
+                        .evaluate_selected(&cdp, input, &target, false)
+                        .await
+                        .map(|(value, _)| value),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        if result.is_err() {
+            self.forget(&cdp).await;
+        }
+        if self.managed() {
+            let _ = crate::managed::keepalive(&self.config);
+        }
+        result
+    }
+
+    /// Reuses one approved socket per endpoint; a changed endpoint or closed socket reconnects.
+    async fn connection(&self) -> Result<Arc<Cdp>, Failure> {
+        let endpoint = if self.managed() {
             crate::managed::endpoint(&self.config).await?
         } else {
             self.config
@@ -72,29 +129,45 @@ impl Browser {
                 .await
                 .map_err(|message| Failure::new("BROWSER_UNAVAILABLE", &message))?
         };
-        let mut cdp = match previous {
-            Some(cdp) if cdp.endpoint == endpoint => cdp,
-            _ => Cdp::connect(&endpoint).await?,
-        };
-        let result = self.evaluate_target(&mut cdp, input).await;
-        if result.is_ok() {
-            *connection = Some(cdp);
+        let mut shared = self.shared.lock().await;
+        if let Some(cdp) = &shared.cdp
+            && cdp.endpoint == endpoint
+            && cdp.is_open()
+        {
+            return Ok(cdp.clone());
         }
-        result
+        *shared = Shared::default();
+        let cdp = Cdp::connect(&endpoint).await?;
+        shared.cdp = Some(cdp.clone());
+        Ok(cdp)
     }
 
-    async fn evaluate_target(&self, cdp: &mut Cdp, input: Value) -> Result<Value, Failure> {
-        if self.config.auth_source == AuthSource::Headless {
-            return self.evaluate_managed(cdp, input).await;
+    /// Detaches the page after a failure so the next call reattaches; a closed socket is dropped.
+    async fn forget(&self, cdp: &Arc<Cdp>) {
+        let mut shared = self.shared.lock().await;
+        if !shared
+            .cdp
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, cdp))
+        {
+            return;
         }
-        let targets = cdp.call("Target.getTargets", json!({}), None).await?;
-        let target = select_target(&targets, self.config.target_id.as_deref())?;
-        self.evaluate_selected(cdp, input, &target, false)
-            .await
-            .map(|(value, _)| value)
+        if !cdp.is_open() {
+            *shared = Shared::default();
+            return;
+        }
+        if let Some(page) = shared.page.take() {
+            let _ = cdp
+                .call(
+                    "Target.detachFromTarget",
+                    json!({"sessionId":page.session}),
+                    None,
+                )
+                .await;
+        }
     }
 
-    async fn evaluate_managed(&self, cdp: &mut Cdp, input: Value) -> Result<Value, Failure> {
+    async fn evaluate_managed(&self, cdp: &Arc<Cdp>, input: Value) -> Result<Value, Failure> {
         let deadline = Instant::now() + READINESS_WAIT;
         let mut reloaded = false;
         loop {
@@ -121,9 +194,16 @@ impl Browser {
                 .await
             {
                 Ok(result) => result,
+                // Restoration can navigate the page (for example to teams.cloud.microsoft)
+                // while the bridge is installed; reattach within the readiness deadline.
                 Err(error)
-                    if error.code == "PAGE_CHANGED" && wait_for_readiness(deadline).await =>
+                    if matches!(
+                        error.code.as_str(),
+                        "PAGE_CHANGED" | "BROWSER_PROTOCOL_ERROR"
+                    ) && cdp.is_open()
+                        && wait_for_readiness(deadline).await =>
                 {
+                    self.forget(cdp).await;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -154,45 +234,170 @@ impl Browser {
 
     async fn evaluate_selected(
         &self,
-        cdp: &mut Cdp,
+        cdp: &Arc<Cdp>,
         input: Value,
         target: &str,
         can_reload: bool,
     ) -> Result<(Value, bool), Failure> {
-        let attached = cdp
-            .call(
-                "Target.attachToTarget",
-                json!({"targetId":target,"flatten":true}),
-                None,
-            )
+        let value = self.call_bridge(cdp, target, input).await?;
+        if !(can_reload && value["error"]["code"] == "AUTH_EXPIRED") {
+            return Ok((value, false));
+        }
+        let page = self.page(cdp, target).await?;
+        cdp.call("Page.reload", json!({}), Some(&page.session))
             .await?;
-        let session = attached["sessionId"]
-            .as_str()
-            .ok_or_else(protocol_error)?
-            .to_owned();
-        let result = evaluate_attached(cdp, input, &session).await;
-        let mut reloaded = false;
-        let result = match result {
-            Ok(value) if can_reload && value["error"]["code"] == "AUTH_EXPIRED" => {
-                reloaded = true;
-                cdp.call("Page.reload", json!({}), Some(&session))
-                    .await
-                    .map(|_| value)
+        self.reset_bridge(&page.session).await;
+        Ok((value, true))
+    }
+
+    async fn call_bridge(
+        &self,
+        cdp: &Arc<Cdp>,
+        target: &str,
+        input: Value,
+    ) -> Result<Value, Failure> {
+        for attempt in 0..2 {
+            let page = self.page(cdp, target).await?;
+            let bridge = page.bridge.clone().ok_or_else(protocol_error)?;
+            let params = json!({"functionDeclaration":CALL_BRIDGE,"objectId":bridge,
+                "arguments":[{"value":input}],"awaitPromise":true,"returnByValue":true});
+            let call = cdp.call("Runtime.callFunctionOn", params, Some(&page.session));
+            let result = if self.managed() {
+                self.with_lease(cdp, &page.session, call).await
+            } else {
+                call.await
+            };
+            match result {
+                Ok(result) if result.get("exceptionDetails").is_some() => {
+                    self.reset_bridge(&page.session).await;
+                    return Err(page_changed());
+                }
+                Ok(result) => {
+                    return result["result"]
+                        .get("value")
+                        .cloned()
+                        .ok_or_else(protocol_error);
+                }
+                // A navigation destroys the installed context; reinstall once on the same socket.
+                Err(_) if attempt == 0 && cdp.is_open() => self.reset_bridge(&page.session).await,
+                Err(error) => return Err(error),
             }
-            result => result,
-        };
-        let detached = cdp
-            .call(
-                "Target.detachFromTarget",
-                json!({"sessionId":session}),
-                None,
-            )
-            .await;
-        match (result, detached) {
-            (Ok(value), Ok(_)) => Ok((value, reloaded)),
-            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+        Err(protocol_error())
+    }
+
+    /// While a managed call runs, keep the idle lease fresh and the page unfrozen.
+    async fn with_lease(
+        &self,
+        cdp: &Arc<Cdp>,
+        session: &str,
+        call: impl Future<Output = Result<Value, Failure>>,
+    ) -> Result<Value, Failure> {
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                result = &mut call => return result,
+                _ = sleep(LEASE_INTERVAL) => {
+                    let _ = crate::managed::keepalive(&self.config);
+                    let _ = cdp.call("Page.setWebLifecycleState", json!({"state":"active"}), Some(session)).await;
+                }
+            }
         }
     }
+
+    /// Returns the attached page for `target`, attaching and installing the bridge when needed.
+    async fn page(&self, cdp: &Arc<Cdp>, target: &str) -> Result<Page, Failure> {
+        let mut shared = self.shared.lock().await;
+        let reusable = shared
+            .page
+            .as_ref()
+            .is_some_and(|page| page.target == target);
+        if !reusable {
+            if let Some(old) = shared.page.take() {
+                let _ = cdp
+                    .call(
+                        "Target.detachFromTarget",
+                        json!({"sessionId":old.session}),
+                        None,
+                    )
+                    .await;
+            }
+            let attached = cdp
+                .call(
+                    "Target.attachToTarget",
+                    json!({"targetId":target,"flatten":true}),
+                    None,
+                )
+                .await?;
+            let session = attached["sessionId"]
+                .as_str()
+                .ok_or_else(protocol_error)?
+                .to_owned();
+            shared.page = Some(Page {
+                target: target.into(),
+                session,
+                bridge: None,
+            });
+        }
+        let page = shared.page.as_mut().ok_or_else(protocol_error)?;
+        if self.managed() {
+            // The managed supervisor freezes an idle page; every call makes it active first.
+            cdp.call(
+                "Page.setWebLifecycleState",
+                json!({"state":"active"}),
+                Some(&page.session),
+            )
+            .await?;
+        }
+        if page.bridge.is_none() {
+            let native = self.config.auth_source == AuthSource::App;
+            page.bridge = Some(install_bridge(cdp, &page.session, native).await?);
+        }
+        Ok(page.clone())
+    }
+
+    async fn reset_bridge(&self, session: &str) {
+        let mut shared = self.shared.lock().await;
+        if let Some(page) = shared.page.as_mut()
+            && page.session == session
+        {
+            page.bridge = None;
+        }
+    }
+}
+
+/// Installs the fixed bridge once per execution context and returns its function handle.
+async fn install_bridge(cdp: &Cdp, session: &str, native: bool) -> Result<String, Failure> {
+    let mut params = json!({"expression":include_str!("bridge.js"),"returnByValue":false});
+    if !native {
+        // The isolated world keeps the bridge away from Teams page scripts. The native
+        // App host bridge is installed in its main world only.
+        let frame = cdp
+            .call("Page.getFrameTree", json!({}), Some(session))
+            .await?;
+        let frame_id = frame["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or_else(protocol_error)?;
+        let world = cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({"frameId":frame_id,"worldName":"teams-mcp"}),
+                Some(session),
+            )
+            .await?;
+        params["contextId"] = world["executionContextId"].clone();
+        if !params["contextId"].is_i64() {
+            return Err(protocol_error());
+        }
+    }
+    let result = cdp.call("Runtime.evaluate", params, Some(session)).await?;
+    if result.get("exceptionDetails").is_some() {
+        return Err(page_changed());
+    }
+    result["result"]["objectId"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(protocol_error)
 }
 
 async fn wait_for_readiness(deadline: Instant) -> bool {
@@ -249,55 +454,7 @@ fn setup_required() -> Failure {
     )
 }
 
-async fn evaluate_attached(cdp: &mut Cdp, input: Value, session: &str) -> Result<Value, Failure> {
-    if input["nativeApp"] == true {
-        // The native host bridge is installed in the app's main world only.
-        return evaluate_expression(cdp, input, session, None).await;
-    }
-    let frame = cdp
-        .call("Page.getFrameTree", json!({}), Some(session))
-        .await?;
-    let frame_id = frame["frameTree"]["frame"]["id"]
-        .as_str()
-        .ok_or_else(protocol_error)?;
-    let world = cdp
-        .call(
-            "Page.createIsolatedWorld",
-            json!({"frameId":frame_id,"worldName":"teams-mcp"}),
-            Some(session),
-        )
-        .await?;
-    let context = world["executionContextId"]
-        .as_i64()
-        .ok_or_else(protocol_error)?;
-    evaluate_expression(cdp, input, session, Some(context)).await
-}
-
-async fn evaluate_expression(
-    cdp: &mut Cdp,
-    input: Value,
-    session: &str,
-    context: Option<i64>,
-) -> Result<Value, Failure> {
-    let expression = format!("({})({input})", include_str!("bridge.js"));
-    let mut params = json!({"expression":expression,"awaitPromise":true,"returnByValue":true});
-    if let Some(context) = context {
-        params["contextId"] = json!(context);
-    }
-    let result = cdp.call("Runtime.evaluate", params, Some(session)).await?;
-    if result.get("exceptionDetails").is_some() {
-        return Err(Failure::new(
-            "PAGE_CHANGED",
-            "Teams changed or closed while the request ran. Retry with the intended Teams tab open.",
-        ));
-    }
-    result["result"]
-        .get("value")
-        .cloned()
-        .ok_or_else(protocol_error)
-}
-
-fn select_target(targets: &Value, selected: Option<&str>) -> Result<String, Failure> {
+pub(crate) fn select_target(targets: &Value, selected: Option<&str>) -> Result<String, Failure> {
     let targets = targets["targetInfos"]
         .as_array()
         .ok_or_else(protocol_error)?;
@@ -325,14 +482,39 @@ fn select_target(targets: &Value, selected: Option<&str>) -> Result<String, Fail
     }
 }
 
+/// One CDP WebSocket shared by concurrent calls. A reader task routes each response
+/// to its caller by ID, so a cancelled call never leaves an unread response behind.
 pub(crate) struct Cdp {
-    socket: Socket,
-    next_id: u64,
-    endpoint: String,
+    writer: Mutex<SplitSink<Socket, Message>>,
+    pending: Pending,
+    next_id: AtomicU64,
+    open: Arc<AtomicBool>,
+    reader: JoinHandle<()>,
+    pub(crate) endpoint: String,
+}
+
+impl Drop for Cdp {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// Removes a call's routing entry when the call completes or is cancelled.
+struct Registration<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
 }
 
 impl Cdp {
-    pub(crate) async fn connect(endpoint: &str) -> Result<Self, Failure> {
+    pub(crate) async fn connect(endpoint: &str) -> Result<Arc<Self>, Failure> {
         let config = WebSocketConfig::default()
             .max_message_size(Some(4 * 1024 * 1024))
             .max_frame_size(Some(4 * 1024 * 1024));
@@ -344,56 +526,97 @@ impl Cdp {
         let (socket, _) = connected
             .map_err(|_| unavailable())?
             .map_err(|_| unavailable())?;
-        Ok(Self {
-            socket,
-            next_id: 1,
+        let (writer, mut reader) = socket.split();
+        let pending: Pending = Arc::default();
+        let open = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn({
+            let pending = pending.clone();
+            let open = open.clone();
+            async move {
+                while let Some(Ok(message)) = reader.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let Ok(mut response) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let Some(id) = response["id"].as_u64() else {
+                        continue;
+                    };
+                    let sender = pending.lock().ok().and_then(|mut map| map.remove(&id));
+                    if let Some(sender) = sender {
+                        let result = if response.get("error").is_some() {
+                            Err(protocol_error())
+                        } else {
+                            response
+                                .get_mut("result")
+                                .map(Value::take)
+                                .ok_or_else(protocol_error)
+                        };
+                        let _ = sender.send(result);
+                    }
+                }
+                open.store(false, Ordering::SeqCst);
+                if let Ok(mut pending) = pending.lock() {
+                    pending.clear();
+                }
+            }
+        });
+        Ok(Arc::new(Self {
+            writer: Mutex::new(writer),
+            pending,
+            next_id: AtomicU64::new(1),
+            open,
+            reader: task,
             endpoint: endpoint.to_owned(),
-        })
+        }))
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn call(
-        &mut self,
+        &self,
         method: &str,
         params: Value,
         session: Option<&str>,
     ) -> Result<Value, Failure> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(id, sender);
+        let _registration = Registration {
+            pending: &self.pending,
+            id,
+        };
+        // The reader marks the socket closed before clearing routes, so this check
+        // cannot miss a response route that was registered after the clear.
+        if !self.is_open() {
+            return Err(unavailable());
+        }
         let mut message = json!({"id":id,"method":method,"params":params});
         if let Some(session) = session {
             message["sessionId"] = json!(session);
         }
-        self.socket
+        self.writer
+            .lock()
+            .await
             .send(Message::Text(message.to_string().into()))
             .await
             .map_err(|_| unavailable())?;
-        loop {
-            let message = self
-                .socket
-                .next()
-                .await
-                .ok_or_else(unavailable)?
-                .map_err(|_| unavailable())?;
-            if let Message::Text(text) = message {
-                let response: Value = serde_json::from_str(&text).map_err(|_| protocol_error())?;
-                if response["id"] != id {
-                    continue;
-                }
-                if response.get("error").is_some() {
-                    return Err(protocol_error());
-                }
-                return response.get("result").cloned().ok_or_else(protocol_error);
-            }
-            if let Message::Ping(bytes) = message {
-                self.socket
-                    .send(Message::Pong(bytes))
-                    .await
-                    .map_err(|_| unavailable())?;
-            }
-        }
+        receiver.await.map_err(|_| unavailable())?
     }
 }
 
+fn page_changed() -> Failure {
+    Failure::new(
+        "PAGE_CHANGED",
+        "Teams changed or closed while the request ran. Retry with the intended Teams tab open.",
+    )
+}
 fn protocol_error() -> Failure {
     Failure::new(
         "BROWSER_PROTOCOL_ERROR",

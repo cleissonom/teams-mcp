@@ -5,7 +5,7 @@ welcome. Keep changes focused on the read-only Teams MCP contract.
 
 ## Development
 
-Use Rust 1.88 or newer. Node.js 22+ is needed for JavaScript bridge tests; Python
+Use Rust 1.89 or newer. Node.js 22+ is needed for JavaScript bridge tests; Python
 3.11+ is needed for packaging tests and optional real-client smoke checks. Chrome
 and a Teams account are needed only for explicitly requested live verification.
 

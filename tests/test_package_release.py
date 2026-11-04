@@ -1,4 +1,6 @@
 import importlib.util
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -116,6 +118,19 @@ class PackageReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MODULE.create_archive(self.root)
             self.assertEqual(list(Path(external).iterdir()), [])
+
+
+class RepositoryManifestTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("cargo"), "cargo is required to list the crate package")
+    def test_release_manifest_matches_the_cargo_package_include_list(self):
+        root = SCRIPT.parents[1]
+        listed = subprocess.run(
+            ["cargo", "package", "--list", "--allow-dirty", "--locked"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.split()
+        generated = {".cargo_vcs_info.json", "Cargo.toml.orig"}
+        manifest = [line for line in (root / "release-files.txt").read_text().splitlines() if line.strip()]
+        self.assertEqual(sorted(set(listed) - generated), sorted(manifest))
 
 
 if __name__ == "__main__":

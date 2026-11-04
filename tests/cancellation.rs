@@ -11,34 +11,28 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 #[tokio::test]
-async fn mcp_cancellation_drops_pending_browser_work_and_allows_the_next_request() {
+async fn mcp_cancellation_releases_pending_browser_work_and_allows_the_next_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
         "ws://{}/devtools/browser/cancellation",
         listener.local_addr().unwrap()
     );
     let (started, pending) = oneshot::channel();
-    let (closed, closure) = oneshot::channel();
+    let (cancelled, cancellation) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut first = accept_async(socket).await.unwrap();
-        reach_evaluation(&mut first).await;
+        let stale = reach_evaluation(&mut first).await;
         started.send(()).unwrap();
-        assert!(
-            matches!(
-                first.next().await,
-                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-            ),
-            "cancelled operation must close its pending CDP socket"
-        );
-        closed.send(()).unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut second = accept_async(socket).await.unwrap();
-        let call = reach_evaluation(&mut second).await;
-        reply(&mut second,&call,json!({"result":{"value":{"ok":true,"profile":{"email":"fixture@example.test"},"capabilities":{"search":true}}}})).await;
-        let detach = receive(&mut second).await;
-        assert_eq!(detach["method"], "Target.detachFromTarget");
-        reply(&mut second, &detach, json!({})).await;
+        cancellation.await.unwrap();
+        // A late answer to the cancelled call must not be delivered to the next request.
+        reply(&mut first, &stale, json!({"result":{"value":{"ok":true,"profile":{"email":"stale@example.test"},"capabilities":{}}}})).await;
+        let targets = receive(&mut first).await;
+        assert_eq!(targets["method"], "Target.getTargets");
+        reply(&mut first, &targets, json!({"targetInfos":[{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})).await;
+        let call = receive(&mut first).await;
+        assert_eq!(call["method"], "Runtime.callFunctionOn");
+        reply(&mut first,&call,json!({"result":{"value":{"ok":true,"profile":{"email":"fixture@example.test"},"capabilities":{"search":true}}}})).await;
     });
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_teams-mcp"))
@@ -70,16 +64,19 @@ async fn mcp_cancellation_drops_pending_browser_work_and_allows_the_next_request
     send(&mut input, tool_call(2)).await;
     timeout(Duration::from_secs(3), pending)
         .await
-        .expect("tool request must reach Runtime.evaluate")
+        .expect("tool request must reach the bridge call")
         .unwrap();
 
     send(&mut input,json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"fixture cancellation"}})).await;
-    timeout(Duration::from_secs(3),closure).await.expect("MCP cancellation must promptly drop the pending CDP socket, rather than wait for the 65-second browser deadline").unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancelled.send(()).unwrap();
 
     send(&mut input, tool_call(3)).await;
     let result = timeout(Duration::from_secs(3), response(&mut output, 3))
         .await
-        .expect("next request must reconnect and complete promptly");
+        .expect(
+            "next request must complete promptly instead of waiting for the 65-second deadline",
+        );
     assert_ne!(result["result"]["isError"], true);
     let data: Value =
         serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -150,12 +147,13 @@ async fn reach_evaluation(socket: &mut WebSocketStream<TcpStream>) -> Value {
             json!({"frameTree":{"frame":{"id":"root"}}}),
         ),
         ("Page.createIsolatedWorld", json!({"executionContextId":42})),
+        ("Runtime.evaluate", json!({"result":{"objectId":"bridge"}})),
     ] {
         let call = receive(socket).await;
         assert_eq!(call["method"], method);
         reply(socket, &call, result).await;
     }
     let call = receive(socket).await;
-    assert_eq!(call["method"], "Runtime.evaluate");
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
     call
 }

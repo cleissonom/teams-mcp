@@ -1,5 +1,54 @@
 # Verification record
 
+## Lightweight runtime update (branch `perf/lightweight-runtime`)
+
+2026-11-04, same Mac and account. Every call was read-only; reports kept metadata
+only (timings, byte counts, item counts and error codes).
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed. |
+| `cargo test --locked` | Passed: 94 Rust tests. |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed. |
+| `node --test tests/bridge.cjs` | Passed: 25 bridge tests. |
+| `python3 -m unittest discover -s tests -p 'test_*.py'` | Passed: 8 tests. |
+| `cargo build --release --locked` | Passed: **2,045,632 bytes**, SHA-256 `7e1d74127ed743ca65c1fb0e9924d5852493caca00246e8868e18612b922931e`. |
+
+Red evidence: the seven new bridge tests failed against the previous `bridge.js`
+and pass now; the restore-navigation readiness test failed without its fix. CDP,
+cancellation and readiness fixtures were updated deliberately for the new protocol
+(one attachment and bridge install per page, input passed to `callFunctionOn`).
+
+Live checks with the managed headless browser:
+
+- All 19 tools ran through one MCP session. `teams_search_people` still returns
+  `FEATURE_UNAVAILABLE` for the guest account.
+- The idle page froze after 15 seconds; the next call made it active again
+  (64 ms including a fresh CLI connection). Two cold restarts succeeded on their
+  first call after the restore-navigation fix.
+- `auth compact` reduced the profile from 974 MiB to 245 MiB (Service Worker
+  cache 727 MiB to 0); after one cold start it was 260 MiB. Sign-in was retained.
+- `auth status` reported state without starting Chrome. `TEAMS_PREWARM=1` started
+  the browser after initialization (initialize itself took 5 ms). `TEAMS_MCP_LOG=1`
+  wrote sanitized timing lines and worker events. `TEAMS_BROWSER_LEAN=1` worked;
+  one sample showed no clear resource gain, so it remains experimental.
+- An observer on the page and the reachable Teams workers saw zero
+  consumption-horizon (read position) writes during the benchmark run.
+
+Before/after benchmark (medians of five warm calls each, same account): idle Chrome
+CPU 1.28% → 0.60%; Skype token exchanges 36 per 46 calls → 2 per 64 calls; six
+concurrent calls 2,716 ms → 616 ms; `teams_get_thread` with 50 messages about
+7,143 → 3,973 tokens and its default page 7,143 → 1,618 tokens; binary 4.65 MB →
+2.05 MB; dependency crates 129 → 97. Idle Chrome memory showed no measurable
+change: an A/B on one binary gave 1,177 vs 1,211 MiB medians with freezing off and
+on, and single runs ranged from 599 to 1,537 MiB. The tool catalog grew from
+5,135 to about 9,578 bytes with eight new tools.
+
+Not rerun: `scripts/smoke-clients.py` (it uses real model clients). The Windows CI
+job and the tagged release workflow have not run on hosted CI.
+
+## Previous record
+
 2026-11-04, macOS. These are observed results on the owner's invited Teams
 account, not a guarantee against future Teams changes or other tenant policies.
 All connector operations exercised were read-only.

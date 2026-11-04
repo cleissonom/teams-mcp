@@ -15,6 +15,7 @@ use rmcp::{
     service::RequestContext,
 };
 use serde_json::{Value, json};
+use std::{sync::OnceLock, time::Instant};
 
 #[derive(Clone)]
 pub struct TeamsServer {
@@ -32,7 +33,30 @@ impl TeamsServer {
         }
     }
 
+    /// The configuration to prewarm after MCP initialization, when opted in.
+    pub fn prewarm_config(&self) -> Option<Config> {
+        (self.config.prewarm && self.config.auth_source == AuthSource::Headless)
+            .then(|| self.config.clone())
+    }
+
     pub async fn execute(&self, name: &str, args: Value) -> Result<Value, Failure> {
+        let started = Instant::now();
+        let result = self.dispatch(name, args).await;
+        if self.config.log {
+            // Diagnostics only: tool name, duration and error code, never content.
+            let code = result
+                .as_ref()
+                .err()
+                .map_or("ok", |error| error.code.as_str());
+            eprintln!(
+                "teams-mcp: tool={name} ms={} result={code}",
+                started.elapsed().as_millis()
+            );
+        }
+        result
+    }
+
+    async fn dispatch(&self, name: &str, args: Value) -> Result<Value, Failure> {
         match name {
             "teams_status" | "teams_get_me" | "teams_login" => {
                 if !args.as_object().is_some_and(|args| args.is_empty()) {
@@ -41,9 +65,9 @@ impl TeamsServer {
                         "This tool accepts an empty object. Use explicit setup to sign in or change accounts.",
                     ));
                 }
-                let value = checked(self.evaluate(json!({"action":"status"})).await?)?;
+                let mut value = checked(self.evaluate(json!({"action":"status"})).await?)?;
                 if name == "teams_get_me" {
-                    return Ok(json!({"profile":value["profile"]}));
+                    return Ok(json!({"profile":value["profile"].take()}));
                 }
                 let source = match self.config.auth_source {
                     AuthSource::Headless => "headless",
@@ -51,7 +75,7 @@ impl TeamsServer {
                     AuthSource::Browser => "existing-browser",
                 };
                 Ok(
-                    json!({"authenticated":true,"profile":value["profile"],"capabilities":value["capabilities"],"authSource":source,"credentialStorage":"source-session-only"}),
+                    json!({"authenticated":true,"profile":value["profile"].take(),"capabilities":value["capabilities"].take(),"authSource":source,"credentialStorage":"source-session-only"}),
                 )
             }
             _ => self.execute_operation(name, args).await,
@@ -64,12 +88,31 @@ impl TeamsServer {
         let mut responses = Vec::new();
         let mut profile = Value::Null;
         for request in operation.requests() {
-            let value = checked(
+            let mut value = checked(
                 self.evaluate(json!({"action":"request","request":request}))
                     .await?,
             )?;
-            profile = value["profile"].clone();
-            responses.push(value["data"].clone());
+            profile = value["profile"].take();
+            responses.push(value["data"].take());
+        }
+        let follow_up = operation
+            .follow_up(&responses, &profile)
+            .map_err(|message| Failure::new("INVALID_RESPONSE", &message))?;
+        if !follow_up.is_empty() {
+            // Dependent reads run together inside the page; each item reports its own result.
+            let mut value = checked(
+                self.evaluate(json!({"action":"batch","requests":follow_up}))
+                    .await?,
+            )?;
+            match value["data"].take() {
+                Value::Array(items) => responses.extend(items),
+                _ => {
+                    return Err(Failure::new(
+                        "INVALID_RESPONSE",
+                        "Teams returned an unsupported batch response.",
+                    ));
+                }
+            }
         }
         operation
             .finish(responses, &profile)
@@ -85,7 +128,12 @@ impl TeamsServer {
     }
 }
 
-pub fn tools() -> Vec<Tool> {
+pub fn tools() -> &'static [Tool] {
+    static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
+    TOOLS.get_or_init(build_tools)
+}
+
+fn build_tools() -> Vec<Tool> {
     let mut tools = operations::tools();
     for (name, description) in [
         (
@@ -153,11 +201,11 @@ impl ServerHandler for TeamsServer {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(ListToolsResult::with_all_items(tools().to_vec()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+        tools().iter().find(|tool| tool.name == name).cloned()
     }
 
     async fn call_tool(

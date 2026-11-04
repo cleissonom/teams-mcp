@@ -6,9 +6,25 @@ use teams_mcp::{
     server::{TeamsServer, outcome},
 };
 
+const USAGE: &str = "Usage: teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version], or teams-mcp auth login [--no-wait]|stop|status|compact.";
+const HELP: &str = "teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version]
+
+teams-mcp auth login     Open the managed profile for normal Teams sign-in, wait for it, save the account and close the window.
+teams-mcp auth login --no-wait   Open the sign-in window and return immediately; finish with auth stop.
+teams-mcp auth stop      Close only this connector's managed browser, retaining its session.
+teams-mcp auth status    Show local setup and browser state without starting Chrome or contacting Teams.
+teams-mcp auth compact   Clear the Teams Service Worker cache in the managed profile; sign-in is kept.
+
+No action: MCP over stdio. Default: managed headless Chrome, shared by MCP clients.
+Common: TEAMS_AUTH_SOURCE, TEAMS_ACCOUNT, TEAMS_TENANT_ID, TEAMS_REQUEST_TIMEOUT_SECS, TEAMS_MCP_LOG.
+Headless: TEAMS_BROWSER_PROFILE, TEAMS_BROWSER_BINARY, TEAMS_BROWSER (chrome|edge|chromium|brave),
+  TEAMS_BROWSER_IDLE_SECS, TEAMS_BROWSER_FREEZE_SECS, TEAMS_BROWSER_CACHE_LIMIT_MB, TEAMS_BROWSER_LEAN, TEAMS_PREWARM.
+Existing browser: TEAMS_CDP_URL, TEAMS_CDP_PORT_FILE, TEAMS_TARGET_ID.
+App (macOS): TEAMS_APP_WINDOW_ID, TEAMS_APP_CDP_URL.
+All tools are read-only. See README.md for setup and platform limitations.";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let mut args: Vec<_> = std::env::args().skip(1).collect();
     let mut config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
@@ -16,77 +32,78 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if args.first().is_some_and(|arg| arg == "__browser-worker") {
-        let headed = match args.as_slice() {
-            [_] => false,
-            [_, mode] if mode == "--headed" => true,
-            _ => return ExitCode::from(2),
-        };
-        return if teams_mcp::managed::worker(&config, headed).await.is_ok() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-    }
-    if args.first().is_some_and(|arg| arg == "auth") {
-        return match args.as_slice() {
-            [_, action] if action == "login" => {
-                print_result(teams_mcp::managed::login(&config).await)
-            }
-            [_, action] if action == "stop" => {
-                print_result(teams_mcp::managed::stop(&config).await)
-            }
-            _ => {
-                eprintln!(
-                    "Usage: teams-mcp auth login|stop. See --help for session configuration."
-                );
-                ExitCode::from(2)
-            }
-        };
-    }
-    if args.first().is_some_and(|arg| arg == "--auth-source") {
-        match args.get(1).and_then(|value| value.parse().ok()) {
-            Some(source) => {
-                config.auth_source = source;
-                args.drain(..2);
-            }
-            None => {
-                eprintln!("--auth-source requires headless, browser or app.");
-                return ExitCode::from(2);
-            }
+    let mut args = Vec::new();
+    let mut pretty = false;
+    let mut raw = std::env::args().skip(1);
+    while let Some(arg) = raw.next() {
+        match arg.as_str() {
+            "--pretty" => pretty = true,
+            "--auth-source" => match raw.next().and_then(|value| value.parse().ok()) {
+                Some(source) => config.auth_source = source,
+                None => {
+                    eprintln!("--auth-source requires headless, browser or app.");
+                    return ExitCode::from(2);
+                }
+            },
+            _ => args.push(arg),
         }
     }
-    let server = TeamsServer::new(config);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let print = |result| print_result(result, pretty);
     match args.as_slice() {
-        [] => serve(server).await,
-        [arg] if arg == "--help" || arg == "-h" => {
-            println!(
-                "teams-mcp [--auth-source headless|browser|app] [--status | --call TOOL JSON | --help | --version]\n\nteams-mcp auth login   Open the managed profile for one-time normal Teams sign-in.\nteams-mcp auth stop    Close only this connector's managed browser, retaining its session.\n\nNo action: MCP over stdio. Default: managed headless Chrome, shared by MCP clients.\nCommon: TEAMS_AUTH_SOURCE, TEAMS_ACCOUNT, TEAMS_TENANT_ID.\nHeadless: TEAMS_BROWSER_PROFILE, TEAMS_BROWSER_BINARY (installed Chrome by default).\nExisting browser: TEAMS_CDP_URL, TEAMS_CDP_PORT_FILE, TEAMS_TARGET_ID.\nApp (macOS): TEAMS_APP_WINDOW_ID, TEAMS_APP_CDP_URL.\nAll tools are read-only. See README.md for setup and platform limitations."
+        ["__browser-worker", rest @ ..] => {
+            let headed = match rest {
+                [] => false,
+                ["--headed"] => true,
+                _ => return ExitCode::from(2),
+            };
+            if teams_mcp::managed::worker(&config, headed).await.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ["auth", "login"] => print(teams_mcp::managed::login(&config, true).await),
+        ["auth", "login", "--no-wait"] => print(teams_mcp::managed::login(&config, false).await),
+        ["auth", "stop"] => print(teams_mcp::managed::stop(&config).await),
+        ["auth", "status"] => print(teams_mcp::managed::status(&config)),
+        ["auth", "compact"] => print(teams_mcp::managed::compact(&config).await),
+        ["auth", ..] => {
+            eprintln!(
+                "Usage: teams-mcp auth login [--no-wait]|stop|status|compact. See --help for session configuration."
             );
+            ExitCode::from(2)
+        }
+        [] => serve(TeamsServer::new(config)).await,
+        ["--help" | "-h"] => {
+            println!("{HELP}");
             ExitCode::SUCCESS
         }
-        [arg] if arg == "--version" => {
+        ["--version"] => {
             println!("teams-mcp {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        [arg] if arg == "--status" => print_result(server.execute("teams_status", json!({})).await),
-        [flag, tool, args] if flag == "--call" => {
-            let Ok(args) = serde_json::from_str::<Value>(args) else {
+        ["--status"] => print(
+            TeamsServer::new(config)
+                .execute("teams_status", json!({}))
+                .await,
+        ),
+        ["--call", tool, arguments] => {
+            let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
                 eprintln!("Arguments must be valid JSON.");
                 return ExitCode::from(2);
             };
-            print_result(server.execute(tool, args).await)
+            print(TeamsServer::new(config).execute(tool, arguments).await)
         }
         _ => {
-            eprintln!(
-                "Usage: teams-mcp [--auth-source headless|browser|app] [--status | --call TOOL JSON | --help | --version], or teams-mcp auth login|stop."
-            );
+            eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
 }
 
 async fn serve(server: TeamsServer) -> ExitCode {
+    let prewarm = server.prewarm_config();
     let service = match server.serve(rmcp::transport::stdio()).await {
         Ok(service) => service,
         Err(_) => {
@@ -94,6 +111,12 @@ async fn serve(server: TeamsServer) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(config) = prewarm {
+        // Opt-in: start the managed browser after initialization without delaying the client.
+        tokio::spawn(async move {
+            let _ = teams_mcp::managed::endpoint(&config).await;
+        });
+    }
     tokio::select! {
         result = service.waiting() => {
             if result.is_ok() { ExitCode::SUCCESS } else { eprintln!("Teams MCP connection ended unexpectedly."); ExitCode::FAILURE }
@@ -102,9 +125,17 @@ async fn serve(server: TeamsServer) -> ExitCode {
     }
 }
 
-fn print_result(result: Result<Value, teams_mcp::error::Failure>) -> ExitCode {
+fn print_result(result: Result<Value, teams_mcp::error::Failure>, pretty: bool) -> ExitCode {
     let success = result.is_ok();
-    println!("{}", outcome(result));
+    let value = outcome(result);
+    if pretty {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+        );
+    } else {
+        println!("{value}");
+    }
     if success {
         ExitCode::SUCCESS
     } else {

@@ -188,6 +188,42 @@ Native REA exports are retained under `.private/native-rea.json` and
 also use focused static LLDB disassembly, distinguished from runtime observations
 above. Private logs and cache content are not copied into this report.
 
+## Read-only endpoint observations (2026-11-04)
+
+A metadata-only probe ran inside the managed page's isolated world with the
+existing bridge's token handling. It returned key names, types, counts and HTTP
+status codes only; no values, tokens or message content were retained.
+
+- The Skype token exchange (`authsvc.teams.microsoft.com/v1.0/authz`) returns
+  `tokens.expiresIn` (2,203 seconds observed) and `regionGtms`, whose
+  `chatServiceAfd`, `chatSvcAggAfd` and `middleTier` values equal the cached
+  discovery roots. The bridge reuses the token until shortly before expiry and uses
+  those roots only as a validated fallback.
+- System conversations exist for `48:notifications` (activity feed:
+  `reaction`, `mention`, `reactionInChat`, `mentionInChat`, `replyToReply`),
+  `48:mentions`, `48:threads` (followed threads), `48:calllogs`, `48:notes`,
+  `48:annotations` and `48:tagmentions`. Their messages carry an `activity`
+  property with source thread, message, reply-chain, sender and preview fields.
+  `48:saved` returned HTTP 404, so saved messages are not offered.
+- CSA `/api/v1/teams/users/me/conversationFolders` returns folders including
+  `Favorites` with conversation IDs.
+- Chat messages accept a `startTime` (epoch milliseconds) filter: all returned
+  messages were at or after it and matched the unfiltered count in that window.
+  Message properties include `emotions`, `mentions`, `files`, `links`, `cards`,
+  `qtdMsgs`, `subject` and `edittime`, some as JSON strings.
+- `/v1/threads/{id}/consumptionhorizons` returned HTTP 403 for a channel and an
+  empty list for meeting and 1:1 chats, so it cannot resolve unknown read
+  positions. 16 of 23 previously unknown conversations were empty conversations.
+- Middle-tier `calendarView` paths returned HTTP 400/404 and `meetingInfo` held
+  only an RSVP status, so meetings are not offered. The Exchange search source
+  returned zero results for the guest account and is not offered.
+- Substrate search honours `from:` and `sent>=`/`sent<=` filters (result totals
+  changed accordingly).
+- In the headless page, `document.visibilityState` was `visible` and
+  `document.hasFocus()` was `true`. Freezing the idle page
+  (`Page.setWebLifecycleState`) cut its CPU from about 2–5% to 0.5%; the next call
+  made it active again in tens of milliseconds.
+
 ## Design and protocol
 
 The reconstruction uses [the official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)

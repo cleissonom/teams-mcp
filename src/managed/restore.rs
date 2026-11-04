@@ -11,7 +11,7 @@ pub(super) async fn prepare(endpoint: &str, url: &str) -> Result<(), Failure> {
 }
 
 async fn prepare_inner(endpoint: &str, url: &str) -> Result<(), Failure> {
-    let mut cdp = Cdp::connect(endpoint).await?;
+    let cdp = Cdp::connect(endpoint).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let targets = loop {
         let targets = cdp.call("Target.getTargets", json!({}), None).await?;
