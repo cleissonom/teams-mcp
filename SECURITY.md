@@ -19,7 +19,11 @@ tokens, signed-in profiles, Keychain data, message bodies or unredacted logs.
 ## Authentication and data boundaries
 
 - Credentials remain in the selected Chrome profile or native Teams session.
-  The Rust process receives normalized results and sanitized errors, not tokens.
+  The default lease transport holds the selected account's short-lived access tokens and Skype token in the MCP
+  process's memory only: never refresh tokens or cookies, never on disk, in logs,
+  in errors or in tool output. They are sent only to the allowlisted Teams endpoints.
+  With `TEAMS_TRANSPORT=page` the Rust process receives normalized results and
+  sanitized errors, not tokens.
 - The managed profile is sensitive local data. Keep it outside the repository
   with owner-only access. Do not sync or email it. On a new computer, sign in
   normally using `teams-mcp auth login`.

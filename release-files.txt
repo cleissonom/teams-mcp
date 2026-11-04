@@ -25,6 +25,7 @@ src/bridge.js
 src/cdp.rs
 src/config.rs
 src/error.rs
+src/lease.rs
 src/lib.rs
 src/main.rs
 src/managed.rs

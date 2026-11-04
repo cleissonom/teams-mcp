@@ -16,10 +16,10 @@ teams-mcp auth status    Show local setup and browser state without starting Chr
 teams-mcp auth compact   Clear the Teams Service Worker cache in the managed profile; sign-in is kept.
 
 No action: MCP over stdio. Default: managed headless Chrome, shared by MCP clients.
-Common: TEAMS_AUTH_SOURCE, TEAMS_ACCOUNT, TEAMS_TENANT_ID, TEAMS_REQUEST_TIMEOUT_SECS, TEAMS_MCP_LOG.
+Common: TEAMS_AUTH_SOURCE, TEAMS_TRANSPORT (page|lease), TEAMS_ACCOUNT, TEAMS_TENANT_ID, TEAMS_REQUEST_TIMEOUT_SECS, TEAMS_MCP_LOG.
 Headless: TEAMS_BROWSER_PROFILE, TEAMS_BROWSER_BINARY, TEAMS_BROWSER (chrome|edge|chromium|brave),
   TEAMS_BROWSER_IDLE_SECS, TEAMS_BROWSER_FREEZE_SECS, TEAMS_BROWSER_CACHE_LIMIT_MB, TEAMS_BROWSER_LEAN, TEAMS_PREWARM.
-Existing browser: TEAMS_CDP_URL, TEAMS_CDP_PORT_FILE, TEAMS_TARGET_ID.
+Existing browser: TEAMS_CDP_URL, TEAMS_CDP_PORT_FILE, TEAMS_TARGET_ID, TEAMS_HIDDEN_TAB.
 App (macOS): TEAMS_APP_WINDOW_ID, TEAMS_APP_CDP_URL.
 All tools are read-only. See README.md for setup and platform limitations.";
 
@@ -103,7 +103,7 @@ async fn main() -> ExitCode {
 }
 
 async fn serve(server: TeamsServer) -> ExitCode {
-    let prewarm = server.prewarm_config();
+    let prewarm = server.prewarm().then(|| server.clone());
     let service = match server.serve(rmcp::transport::stdio()).await {
         Ok(service) => service,
         Err(_) => {
@@ -111,10 +111,10 @@ async fn serve(server: TeamsServer) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(config) = prewarm {
-        // Opt-in: start the managed browser after initialization without delaying the client.
+    if let Some(server) = prewarm {
+        // Opt-in: ready the session (or mint a lease) after initialization without delaying the client.
         tokio::spawn(async move {
-            let _ = teams_mcp::managed::endpoint(&config).await;
+            let _ = server.execute("teams_status", json!({})).await;
         });
     }
     tokio::select! {

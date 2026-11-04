@@ -29,6 +29,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 # Hostnames are compared as exact ASCII; this stub IDNA back end avoids the ICU4X data tree.
 idna_adapter = "=1.0.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

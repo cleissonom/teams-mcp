@@ -57,8 +57,10 @@ impl Fixture {
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_teams-mcp"));
+        // Lifecycle fixtures exercise the page transport's long-lived browser explicitly.
         command
             .env("TEAMS_AUTH_SOURCE", "headless")
+            .env("TEAMS_TRANSPORT", "page")
             .env("TEAMS_BROWSER_PROFILE", &self.profile)
             .env("TEAMS_BROWSER_BINARY", &self.browser);
         for key in [
@@ -421,6 +423,23 @@ async fn compact_clears_only_teams_cache_storage_through_chrome() {
         fixture.profile.join("Default").is_dir(),
         "sign-in profile must remain"
     );
+    managed::stop(&fixture.config()).await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn default_lease_transport_mints_then_stops_the_browser_soon() {
+    let fixture = Fixture::new(true);
+    fs::write(fixture.profile.join("fixture-bridge-response"),json!({"ok":true,"profile":{"id":"fixture-user","tenantId":"22222222-2222-4222-8222-222222222222"},"lease":{"spaces":{"token":"fixture-spaces","expiresAt":4102444800u64}}}).to_string()).unwrap();
+    let mut call = fixture.command();
+    call.env_remove("TEAMS_TRANSPORT").arg("--status");
+    let result = output(call).await;
+    assert_eq!(result["transport"], "lease");
+    assert_eq!(result["capabilities"]["chat"], true);
+    assert!(!result.to_string().contains("fixture-spaces"));
+    let mut status = fixture.command();
+    status.args(["auth", "status"]);
+    assert_eq!(output(status).await["browser"]["stopsAfterIdleSeconds"], 20);
     managed::stop(&fixture.config()).await.unwrap();
 }
 

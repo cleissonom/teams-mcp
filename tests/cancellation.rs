@@ -37,6 +37,7 @@ async fn mcp_cancellation_releases_pending_browser_work_and_allows_the_next_requ
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_teams-mcp"))
         .env("TEAMS_AUTH_SOURCE", "browser")
+        .env("TEAMS_TRANSPORT", "page")
         .env("TEAMS_CDP_URL", endpoint)
         .env_remove("TEAMS_TARGET_ID")
         .env_remove("TEAMS_ACCOUNT")

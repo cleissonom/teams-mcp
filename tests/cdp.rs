@@ -403,3 +403,96 @@ async fn app_cdp_uses_its_explicit_endpoint_and_native_host_world() {
     drop(browser);
     server.await.unwrap();
 }
+
+async fn hidden_fixture(url: &'static str) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let (listener, endpoint) = listener("hidden").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        let mut methods = Vec::new();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let call: Value = serde_json::from_str(&text).unwrap();
+            let method = call["method"].as_str().unwrap().to_owned();
+            let result = match method.as_str() {
+                "Target.createTarget" => {
+                    assert_eq!(call["params"]["hidden"], true);
+                    assert_eq!(
+                        call["params"]["url"],
+                        "https://teams.microsoft.com/v2/?tenantId=11111111-2222-4333-8444-555555555555"
+                    );
+                    json!({"targetId":"hidden"})
+                }
+                "Target.getTargetInfo" => {
+                    json!({"targetInfo":{"targetId":"hidden","type":"other","url":url}})
+                }
+                "Target.attachToTarget" => {
+                    assert_eq!(call["params"]["targetId"], "hidden");
+                    json!({"sessionId":"hidden-session"})
+                }
+                "Target.closeTarget" => {
+                    assert_eq!(call["params"]["targetId"], "hidden");
+                    json!({"success":true})
+                }
+                "Target.getTargets" => panic!("hidden-tab mode must not inspect the user's tabs"),
+                other => standard_result(other),
+            };
+            methods.push(method);
+            reply(&mut ws, &call, result).await;
+        }
+        methods
+    });
+    (endpoint, server)
+}
+
+fn hidden_browser(endpoint: String) -> Browser {
+    Browser::new(Config {
+        auth_source: teams_mcp::config::AuthSource::Browser,
+        cdp_url: Some(endpoint),
+        hidden_tab: true,
+        tenant: Some("11111111-2222-4333-8444-555555555555".into()),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn hidden_tab_mode_uses_only_its_own_hidden_target_and_closes_it() {
+    let (endpoint, server) = hidden_fixture("https://teams.microsoft.com/v2/").await;
+    let browser = hidden_browser(endpoint);
+    let result = browser.evaluate(json!({"action":"lease"})).await.unwrap();
+    assert_eq!(result["ok"], true);
+    browser.release_hidden().await;
+    drop(browser);
+    let methods = server.await.unwrap();
+    assert_eq!(
+        methods.first().map(String::as_str),
+        Some("Target.createTarget")
+    );
+    assert_eq!(
+        methods.last().map(String::as_str),
+        Some("Target.closeTarget")
+    );
+}
+
+#[tokio::test]
+async fn hidden_tab_redirected_to_signin_is_never_attached() {
+    let (endpoint, server) =
+        hidden_fixture("https://login.microsoftonline.com/common/oauth2/authorize").await;
+    let browser = hidden_browser(endpoint);
+    let error = browser
+        .evaluate(json!({"action":"lease"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "BROWSER_SIGNIN_REQUIRED");
+    browser.release_hidden().await;
+    drop(browser);
+    let methods = server.await.unwrap();
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Target.attachToTarget")
+    );
+    assert_eq!(
+        methods.last().map(String::as_str),
+        Some("Target.closeTarget")
+    );
+}

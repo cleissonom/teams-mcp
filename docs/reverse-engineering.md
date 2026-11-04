@@ -224,6 +224,22 @@ status codes only; no values, tokens or message content were retained.
   (`Page.setWebLifecycleState`) cut its CPU from about 2–5% to 0.5%; the next call
   made it active again in tens of milliseconds.
 
+## Token lifetimes and renewal (2026-11-04)
+
+A metadata-only probe read token expiry claims inside the managed page; no token
+values were returned. Access tokens for chat (Spaces), search (Substrate) and
+channels (CSA) had 85, 78 and 92 minute lifetimes without long-lived (CAE) claims.
+The Skype token's `expiresIn` matched the remaining Spaces token lifetime. The single
+MSAL refresh token carried an expiry with about 16 hours remaining, consistent with
+the 24-hour limit for browser (SPA) refresh tokens, so exporting it could not remove
+the browser anyway.
+
+Teams did not renew still-valid tokens at boot: a later cold start held the same
+tokens. After the search token had expired, the next cold start obtained a new one
+within about two seconds. The lease transport therefore uses the same five-minute
+margin as MSAL's renewal window and, when a needed token is inside it, re-reads the
+session for up to 30 seconds while Teams renews it.
+
 ## Design and protocol
 
 The reconstruction uses [the official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
