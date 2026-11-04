@@ -49,6 +49,8 @@ pub struct Browser {
 struct Shared {
     cdp: Option<Arc<Cdp>>,
     page: Option<Page>,
+    /// The connector-owned hidden Teams target in an existing browser, when enabled.
+    hidden: Option<String>,
 }
 
 /// A target session that stays attached across calls, with its installed bridge function.
@@ -94,10 +96,128 @@ impl Browser {
         self.config.auth_source == AuthSource::Headless
     }
 
+    fn hidden_tab(&self) -> bool {
+        self.config.hidden_tab && self.config.auth_source == AuthSource::Browser
+    }
+
+    /// Uses a hidden Teams target that the connector creates in the existing browser.
+    /// It shares the browser's normal sign-in but never appears in the tab strip, and the
+    /// connector never attaches to the user's own tabs or to sign-in pages.
+    async fn evaluate_hidden(&self, cdp: &Arc<Cdp>, input: Value) -> Result<Value, Failure> {
+        let target = self.hidden_target(cdp).await?;
+        let deadline = Instant::now() + READINESS_WAIT;
+        loop {
+            let info = cdp
+                .call("Target.getTargetInfo", json!({"targetId":target}), None)
+                .await?;
+            let url = info["targetInfo"]["url"].as_str().unwrap_or("");
+            if microsoft_signin(url) {
+                return Err(browser_signin_required());
+            }
+            if is_teams_page(url) {
+                match self
+                    .evaluate_selected(cdp, input.clone(), &target, false)
+                    .await
+                {
+                    Ok((value, _)) => {
+                        let loading = matches!(
+                            value["error"]["code"].as_str().unwrap_or(""),
+                            "AUTH_REQUIRED"
+                                | "SESSION_UNAVAILABLE"
+                                | "REGION_UNAVAILABLE"
+                                | "WRONG_ORIGIN"
+                        );
+                        if !(loading && wait_for_readiness(deadline).await) {
+                            return Ok(value);
+                        }
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "PAGE_CHANGED" | "BROWSER_PROTOCOL_ERROR"
+                        ) && cdp.is_open()
+                            && wait_for_readiness(deadline).await =>
+                    {
+                        self.forget(cdp).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !wait_for_readiness(deadline).await {
+                return Err(Failure::new(
+                    "TEAMS_TAB_REQUIRED",
+                    "The hidden Teams page did not finish loading in the existing browser. Check that Teams opens there normally, then retry.",
+                ));
+            }
+        }
+    }
+
+    async fn hidden_target(&self, cdp: &Arc<Cdp>) -> Result<String, Failure> {
+        let mut shared = self.shared.lock().await;
+        if let Some(target) = shared.hidden.clone() {
+            if cdp
+                .call("Target.getTargetInfo", json!({"targetId":target}), None)
+                .await
+                .is_ok()
+            {
+                return Ok(target);
+            }
+            shared.hidden = None;
+        }
+        let mut url =
+            url::Url::parse("https://teams.microsoft.com/v2/").map_err(|_| protocol_error())?;
+        if let Some(tenant) = self
+            .config
+            .tenant
+            .as_deref()
+            .and_then(|tenant| uuid::Uuid::parse_str(tenant).ok())
+        {
+            url.query_pairs_mut()
+                .append_pair("tenantId", &tenant.to_string());
+        }
+        let created = cdp
+            .call(
+                "Target.createTarget",
+                json!({"url":url.as_str(),"hidden":true}),
+                None,
+            )
+            .await?;
+        let target = created["targetId"]
+            .as_str()
+            .ok_or_else(protocol_error)?
+            .to_owned();
+        shared.hidden = Some(target.clone());
+        Ok(target)
+    }
+
+    /// Closes the connector-owned hidden target, freeing its memory in the existing browser.
+    pub async fn release_hidden(&self) {
+        let mut shared = self.shared.lock().await;
+        let Some(target) = shared.hidden.take() else {
+            return;
+        };
+        if shared
+            .page
+            .as_ref()
+            .is_some_and(|page| page.target == target)
+        {
+            shared.page = None;
+        }
+        if let Some(cdp) = shared.cdp.clone() {
+            let _ = cdp
+                .call("Target.closeTarget", json!({"targetId":target}), None)
+                .await;
+        }
+    }
+
     async fn evaluate_inner(&self, input: Value) -> Result<Value, Failure> {
         let cdp = self.connection().await?;
         let result = if self.managed() {
             self.evaluate_managed(&cdp, input).await
+        } else if self.hidden_tab() {
+            self.evaluate_hidden(&cdp, input).await
         } else {
             match cdp.call("Target.getTargets", json!({}), None).await {
                 Ok(targets) => match select_target(&targets, self.config.target_id.as_deref()) {
@@ -445,6 +565,13 @@ fn microsoft_signin(value: &str) -> bool {
                 )
             )
     })
+}
+
+fn browser_signin_required() -> Failure {
+    Failure::new(
+        "BROWSER_SIGNIN_REQUIRED",
+        "This browser is not signed in to Teams for the selected account. Open Teams in it once and sign in normally; the connector never completes sign-in for you.",
+    )
 }
 
 fn setup_required() -> Failure {

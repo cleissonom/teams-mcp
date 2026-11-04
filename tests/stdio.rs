@@ -21,9 +21,19 @@ async fn headless_handshake_and_discovery_do_not_launch_chrome_or_require_setup(
     disconnected_handshake("headless", "2025-11-25").await;
 }
 
+#[tokio::test]
+async fn lease_transport_stays_lazy_and_reports_setup_without_a_browser() {
+    disconnected_handshake_with("headless", "2025-11-25", "lease").await;
+}
+
 async fn disconnected_handshake(source: &str, protocol: &str) {
+    disconnected_handshake_with(source, protocol, "page").await;
+}
+
+async fn disconnected_handshake_with(source: &str, protocol: &str, transport: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_teams-mcp"))
         .env("TEAMS_AUTH_SOURCE", source)
+        .env("TEAMS_TRANSPORT", transport)
         .env(
             "TEAMS_BROWSER_PROFILE",
             std::env::temp_dir().join(format!("teams-absent-{}", uuid::Uuid::new_v4())),

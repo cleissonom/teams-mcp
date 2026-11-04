@@ -1,8 +1,9 @@
 use crate::{
     app::App,
     cdp::Browser,
-    config::{AuthSource, Config},
+    config::{AuthSource, Config, Transport},
     error::Failure,
+    lease::{Lease, Mint},
     operations::{self, Operation},
 };
 use rmcp::{
@@ -15,28 +16,48 @@ use rmcp::{
     service::RequestContext,
 };
 use serde_json::{Value, json};
-use std::{sync::OnceLock, time::Instant};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 #[derive(Clone)]
 pub struct TeamsServer {
     browser: Browser,
     app: App,
     config: Config,
+    /// Present in lease transport: tokens minted by the session, requests sent from Rust.
+    lease: Option<Result<Arc<Lease>, Failure>>,
 }
 
 impl TeamsServer {
     pub fn new(config: Config) -> Self {
+        let browser = Browser::new(config.clone());
+        let app = App::new(config.clone());
+        let lease = (config.transport == Transport::Lease).then(|| {
+            let (source, browser, app) = (config.clone(), browser.clone(), app.clone());
+            let mint: Mint = Arc::new(move || {
+                let (source, browser, app) = (source.clone(), browser.clone(), app.clone());
+                Box::pin(async move {
+                    let minted = session(&source, &browser, &app, json!({"action":"lease"})).await;
+                    // A hidden Teams page in the user's browser is only needed while minting.
+                    browser.release_hidden().await;
+                    minted
+                })
+            });
+            Lease::new(mint, config.log).map(Arc::new)
+        });
         Self {
-            browser: Browser::new(config.clone()),
-            app: App::new(config.clone()),
+            browser,
+            app,
             config,
+            lease,
         }
     }
 
-    /// The configuration to prewarm after MCP initialization, when opted in.
-    pub fn prewarm_config(&self) -> Option<Config> {
-        (self.config.prewarm && self.config.auth_source == AuthSource::Headless)
-            .then(|| self.config.clone())
+    /// Whether to warm the session after MCP initialization (opt-in).
+    pub fn prewarm(&self) -> bool {
+        self.config.prewarm
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<Value, Failure> {
@@ -74,8 +95,15 @@ impl TeamsServer {
                     AuthSource::App => "existing-app",
                     AuthSource::Browser => "existing-browser",
                 };
+                let (transport, storage) = match self.config.transport {
+                    Transport::Page => ("page", "source-session-only"),
+                    Transport::Lease => (
+                        "lease",
+                        "source-session; short-lived access tokens in memory",
+                    ),
+                };
                 Ok(
-                    json!({"authenticated":true,"profile":value["profile"].take(),"capabilities":value["capabilities"].take(),"authSource":source,"credentialStorage":"source-session-only"}),
+                    json!({"authenticated":true,"profile":value["profile"].take(),"capabilities":value["capabilities"].take(),"authSource":source,"transport":transport,"credentialStorage":storage}),
                 )
             }
             _ => self.execute_operation(name, args).await,
@@ -120,11 +148,25 @@ impl TeamsServer {
     }
 
     async fn evaluate(&self, input: Value) -> Result<Value, Failure> {
-        if self.config.auth_source == AuthSource::App && self.config.app_cdp_url.is_none() {
-            self.app.evaluate(input).await
-        } else {
-            self.browser.evaluate(input).await
+        match &self.lease {
+            Some(Ok(lease)) => lease.evaluate(input).await,
+            Some(Err(error)) => Err(error.clone()),
+            None => session(&self.config, &self.browser, &self.app, input).await,
         }
+    }
+}
+
+/// Runs the fixed bridge in the configured browser or App session.
+async fn session(
+    config: &Config,
+    browser: &Browser,
+    app: &App,
+    input: Value,
+) -> Result<Value, Failure> {
+    if config.auth_source == AuthSource::App && config.app_cdp_url.is_none() {
+        app.evaluate(input).await
+    } else {
+        browser.evaluate(input).await
     }
 }
 

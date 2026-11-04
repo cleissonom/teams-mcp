@@ -245,3 +245,15 @@ test('conversation folders are an allowed read and other CSA paths are not',asyn
  assert.equal((await run({action:'request',request:{service:'csa',path:'/api/v1/teams/users/me/conversationFolders',method:'GET',query:[],body:null}})).ok,true);
  assert.equal((await run({action:'request',request:{service:'csa',path:'/api/v1/teams/users/me/other',method:'GET',query:[],body:null}})).error.code,'UNSAFE_ENDPOINT');
 });
+
+test('lease returns only the selected account access tokens and never refresh tokens',async()=>{
+ const foreign={...token,secret:jwt({...claims,oid:'user-two',tid:'tenant-two',aud:'https://api.spaces.skype.com'}),target:'https://api.spaces.skype.com/.default'};
+ const storage=chatStorage({'msal.client.active-account-filters':JSON.stringify({localAccountId:'user-one',tenantId:'tenant-one'}),
+  'foreign-accesstoken':JSON.stringify(foreign),
+  'own-refreshtoken':JSON.stringify({credentialType:'RefreshToken',homeAccountId:'home-one',secret:'refresh-marker'})});
+ const result=await environment(storage)({action:'lease'});
+ assert.equal(result.ok,true);assert.equal(result.profile.tenantId,'tenant-one');
+ assert.equal(result.lease.spaces.token,spaces.secret);assert.equal(result.lease.spaces.expiresAt,claims.exp);
+ assert.equal(result.lease.search.token,token.secret);assert.equal(result.lease.csa,null);
+ assert.ok(!JSON.stringify(result).includes('refresh-marker'));assert.ok(!JSON.stringify(result).includes(foreign.secret));
+});

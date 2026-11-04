@@ -1,5 +1,38 @@
 # Verification record
 
+## Lease transport (branch `perf/token-lease`)
+
+2026-11-04, same Mac and account; read-only calls, metadata-only reports. Lease is
+now the default transport; `TEAMS_TRANSPORT=page` selects the previous one.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed. |
+| `cargo test --locked` | Passed: 103 Rust tests (lease HTTP client against a local peer, allowlist, hidden-tab CDP fixtures, lazy lease handshake). |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed. |
+| `node --test tests/bridge.cjs` | Passed: 26 tests, including the lease action excluding refresh tokens and other accounts. |
+| `python3 -m unittest discover -s tests -p 'test_*.py'` | Passed: 8 tests. |
+| `cargo build --release --locked` | Passed: 2,596,272 bytes. |
+
+Live: all 19 tools succeeded with `TEAMS_TRANSPORT=lease` (people search still returns
+`FEATURE_UNAVAILABLE` for the guest account). The managed browser stopped about 20
+seconds after minting, and later calls ran over HTTPS with Chrome stopped. Lease
+minting also worked against an already running browser through `--auth-source browser`,
+and with `TEAMS_HIDDEN_TAB=1` through a hidden target that was closed afterwards while
+the visible Teams tab was never used.
+
+A 10-minute simulated agent session per transport (8 bursts of 4 calls, then 3 idle
+minutes, memory sampled every 2 seconds): average memory 1,042 MiB (page) vs 80 MiB
+(lease); Chrome running 578 s vs 22 s; Chrome CPU 28.4 s vs 16.2 s; median warm call
+697 ms vs 711 ms; zero failed calls in both. Peak memory was the same (about 2 GB,
+during the cold start); the MCP server grew from 8.0 to 11.9 MiB with the HTTPS client,
+and the first call took 5.4 s instead of 2.9 s. The session runs used the lease build
+before the hidden-tab option was added; the managed lease path is otherwise unchanged.
+
+Not run: the hidden-tab mode against the owner's own Chrome (it needs the owner's
+debugging approval and a Teams sign-in in that browser); token renewal after a real
+80-minute expiry (unit tests cover re-minting near expiry and after rejection).
+
 ## Lightweight runtime update (branch `perf/lightweight-runtime`)
 
 2026-11-04, same Mac and account. Every call was read-only; reports kept metadata

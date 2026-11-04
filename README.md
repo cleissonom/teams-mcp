@@ -1,15 +1,17 @@
 # Teams MCP — Rust
 
 An unofficial, read-only Microsoft Teams MCP server for Codex and Claude Code.
-The default runtime is a Rust binary plus **one shared headless Chrome session**, started only when a tool needs
-it. No Node, Playwright, browser download, separate OAuth app registration, or
-credential-export service is required. Chrome handles normal Microsoft SSO.
+The default runtime is a Rust binary that calls Teams over HTTPS, plus a **shared
+headless Chrome session used only to mint short-lived access tokens**. Chrome starts
+when a token is needed (about once per 80 minutes of use) and stops 20 seconds
+later. No Node, Playwright, browser download, separate OAuth app registration, or
+credential-export service is required. Chrome handles normal Microsoft SSO, and its
+refresh tokens and cookies never leave it.
 
-The managed browser retains its own profile and is shared across MCP clients. Its
-Teams page is frozen 15 seconds after the last tool call (near-zero CPU) and the
-browser stops after five idle minutes; both are configurable. Its cookies and tokens
-remain in Chrome. Normal tool calls never open a visible window. Existing browser
-and native App adapters remain explicit alternatives.
+The managed browser retains its own profile and is shared across MCP clients. Normal
+tool calls never open a visible window. `TEAMS_TRANSPORT=page` keeps the previous
+transport, where every call runs inside a resident Teams page. Existing browser and
+native App adapters remain explicit alternatives.
 
 ## Build and sign in
 
@@ -198,21 +200,47 @@ intended Teams organization. Never move a signed-in profile through Git or email
 
 ## Session lifetime and resource use
 
-The Teams page is frozen 15 seconds after the last tool call and made active again
-by the next one (tens of milliseconds). The background browser stops after five
-idle minutes and restarts on the next tool call. Its saved profile survives that
+With the page transport, the Teams page is frozen 15 seconds after the last tool call
+and made active again by the next one (tens of milliseconds), and the background
+browser stops after five idle minutes. With the default lease transport it stops 20
+seconds after minting. Its saved profile survives that
 shutdown. Interactive setup windows close after fifteen minutes without connector
 activity.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `TEAMS_BROWSER_IDLE_SECS` | `300` | Stop the managed browser after this idle time (90–86400) |
-| `TEAMS_BROWSER_FREEZE_SECS` | `15` | Freeze the idle Teams page after this time; `0` disables |
+| `TEAMS_TRANSPORT` | `lease` | `page`: run every call inside a resident Teams page; see below |
+| `TEAMS_HIDDEN_TAB` | off | Existing browser only: use a connector-owned hidden Teams target |
+| `TEAMS_BROWSER_IDLE_SECS` | `20` (`300` with `page`) | Stop the managed browser after this idle time (10–86400) |
+| `TEAMS_BROWSER_FREEZE_SECS` | `15` | Page transport: freeze the idle Teams page after this time; `0` disables |
 | `TEAMS_REQUEST_TIMEOUT_SECS` | `65` | Upper bound for one tool call, including a cold start |
 | `TEAMS_BROWSER_CACHE_LIMIT_MB` | unset | At shutdown, clear Teams' Service Worker cache above this size |
 | `TEAMS_BROWSER_LEAN` | off | Experimental: no images and no Microsoft telemetry hosts in the hidden page |
 | `TEAMS_PREWARM` | off | Start the managed browser right after MCP initialization |
 | `TEAMS_MCP_LOG` | off | Timings and error codes (never content) on stderr and in a worker log |
+
+### Lease transport (default) and page transport
+
+The lease transport keeps the browser for authentication only. The selected
+session mints the account's short-lived access tokens (about 80–90 minutes); the MCP
+process then calls Teams over HTTPS with the same endpoint allowlist, exact origins,
+2 MiB response limit, no redirects and retries as the in-page bridge. The managed
+headless browser stops 20 seconds after minting and starts again only when a needed
+token is within five minutes of expiry or is rejected. Refresh tokens and cookies
+never leave the browser; access tokens stay in the MCP process's memory and are never
+written to disk, logged or returned to clients. In a 10-minute agent session this
+averaged 80 MiB instead of about 1 GiB with the page transport, with the same warm
+call latency. `TEAMS_TRANSPORT=page` restores the page transport if a tenant rejects
+direct API calls or you prefer that no token leaves the browser.
+
+With `--auth-source browser`, the lease is minted from your own approved Chrome, so no
+managed browser runs at all. By default it uses an already open, signed-in Teams tab.
+With `TEAMS_HIDDEN_TAB=1` the connector instead creates its own hidden Teams target
+(not shown in the tab strip) that shares your browser's normal sign-in, mints the
+lease and closes it; it never uses your visible tabs or sign-in pages. If that browser
+is not signed in to Teams, calls return `BROWSER_SIGNIN_REQUIRED`. Renewal repeats
+roughly once per token lifetime, and Chrome asks for debugging approval once per MCP
+process.
 
 Teams' Service Worker cache can grow to hundreds of megabytes. `teams-mcp auth
 compact` clears only that cache through Chrome; sign-in data stays, and the next

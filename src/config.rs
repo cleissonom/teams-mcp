@@ -22,6 +22,28 @@ impl std::str::FromStr for AuthSource {
     }
 }
 
+/// How tool requests reach Teams once authenticated.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// Every request runs inside the Teams page through the bridge.
+    Page,
+    /// The browser only mints short-lived access tokens; Rust calls Teams over HTTPS.
+    #[default]
+    Lease,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "page" => Ok(Self::Page),
+            "lease" => Ok(Self::Lease),
+            _ => Err("TEAMS_TRANSPORT must be page or lease.".into()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserKind {
     Chrome,
@@ -56,6 +78,7 @@ pub struct Config {
     pub target_id: Option<String>,
     pub account: Option<String>,
     pub tenant: Option<String>,
+    pub transport: Transport,
     /// Upper bound for one tool call, including a cold browser start.
     pub request_timeout: Duration,
     /// Stop the managed headless browser after this much inactivity.
@@ -67,6 +90,8 @@ pub struct Config {
     pub lean: bool,
     pub prewarm: bool,
     pub log: bool,
+    /// Existing-browser mode only: use a connector-owned hidden Teams target, never a visible tab.
+    pub hidden_tab: bool,
 }
 
 impl Default for Config {
@@ -82,6 +107,7 @@ impl Default for Config {
             target_id: None,
             account: None,
             tenant: None,
+            transport: Transport::Lease,
             request_timeout: Duration::from_secs(65),
             idle: Duration::from_secs(300),
             freeze: Some(Duration::from_secs(15)),
@@ -90,12 +116,24 @@ impl Default for Config {
             lean: false,
             prewarm: false,
             log: false,
+            hidden_tab: false,
         }
     }
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
+        let transport: Transport = env::var("TEAMS_TRANSPORT")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or_default();
+        // A lease only needs the browser while it mints tokens, so it stops soon after.
+        let idle_default = if transport == Transport::Lease {
+            20
+        } else {
+            300
+        };
         Ok(Self {
             auth_source: env::var("TEAMS_AUTH_SOURCE")
                 .unwrap_or_else(|_| "headless".into())
@@ -125,11 +163,12 @@ impl Config {
             target_id: env::var("TEAMS_TARGET_ID").ok(),
             account: env::var("TEAMS_ACCOUNT").ok(),
             tenant: env::var("TEAMS_TENANT_ID").ok(),
+            transport,
             request_timeout: Duration::from_secs(
                 seconds("TEAMS_REQUEST_TIMEOUT_SECS", 10, 300)?.unwrap_or(65),
             ),
             idle: Duration::from_secs(
-                seconds("TEAMS_BROWSER_IDLE_SECS", 90, 86_400)?.unwrap_or(300),
+                seconds("TEAMS_BROWSER_IDLE_SECS", 10, 86_400)?.unwrap_or(idle_default),
             ),
             freeze: match env::var("TEAMS_BROWSER_FREEZE_SECS").as_deref() {
                 Ok("0") => None,
@@ -145,6 +184,7 @@ impl Config {
             lean: flag("TEAMS_BROWSER_LEAN"),
             prewarm: flag("TEAMS_PREWARM"),
             log: flag("TEAMS_MCP_LOG"),
+            hidden_tab: flag("TEAMS_HIDDEN_TAB"),
         })
     }
 
@@ -293,4 +333,17 @@ pub fn is_teams_page(value: &str) -> bool {
                 Some("teams.microsoft.com" | "teams.cloud.microsoft")
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_is_the_default_transport_and_page_remains_selectable() {
+        assert_eq!(Transport::default(), Transport::Lease);
+        assert_eq!(Config::default().transport, Transport::Lease);
+        assert_eq!("page".parse::<Transport>().unwrap(), Transport::Page);
+        assert!("other".parse::<Transport>().is_err());
+    }
 }

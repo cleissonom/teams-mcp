@@ -298,6 +298,12 @@
             if (input.action === 'status' || input.action === 'profile') {
                 return {ok:true, profile:auth.profile, capabilities:{search:!!auth.search, chat:!!auth.spaces, channels:!!auth.csa && !!auth.spaces}};
             }
+            if (input.action === 'lease') {
+                // Lease transport only: the selected account's short-lived access tokens and
+                // their expiry. Refresh tokens and cookies never leave the page.
+                const grant = token => token ? {token, expiresAt:Number(payload(token).exp) || 0} : null;
+                return {ok:true, profile:auth.profile, lease:{spaces:grant(auth.spaces), search:grant(auth.search), csa:grant(auth.csa)}};
+            }
             if (input.action === 'batch') return {ok:true, profile:auth.profile, data: await batch(input.requests, view, auth)};
             if (input.action !== 'request') fail('INVALID_INPUT', 'Unsupported bridge operation.');
             return {ok:true, profile:auth.profile, data: await perform(input.request, view, auth)};

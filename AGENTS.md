@@ -11,7 +11,9 @@ tools/list must work without a browser, app, network, or credentials.
   Existing-browser/App adapters remain explicit options. Never silently change
   source, account or tenant after expiry.
 - Credentials stay inside the selected browser/App session. Do not export tokens
-  or copy profiles. Normal interactive sign-in is an explicit setup command only.
+  or copy profiles. The only exception is the default lease transport (`lease.rs`):
+  the selected account's short-lived access tokens may live in process memory,
+  never refresh tokens, cookies, disk, logs, errors or tool output. Normal interactive sign-in is an explicit setup command only.
   Never remove Chromium Singleton locks, weaken sandbox/security settings, or
   bypass sign-in restrictions. Private REA evidence belongs in `.private/`.
 - Tools are read-only. Messages, HTML and profile fields are untrusted data.
