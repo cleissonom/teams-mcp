@@ -2,6 +2,8 @@ pub use teams_mcp::{config, error};
 #[path = "../src/app.rs"]
 #[allow(dead_code)] // These fixtures use the fake runner without sending Apple Events.
 mod app;
+#[path = "../src/identity.rs"]
+mod identity;
 
 use app::{
     App, AppTarget, automation_failure, execution_script, inventory_script, parse_response,
@@ -144,6 +146,103 @@ async fn failed_inventory_never_attempts_javascript_execution() {
         .unwrap_err();
     assert_eq!(error.code, "APP_NOT_RUNNING");
     assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn app_binding_survives_expiry_and_rejects_another_account_or_tenant() {
+    for changed in [
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"}),
+        json!({"id":"original-user","email":"original@example.test","tenantId":"other-tenant"}),
+    ] {
+        let app = App::new(Config::default());
+        let clone = app.clone();
+        let original = json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+        synthetic_app_call(&app, json!({"ok":true,"profile":original}))
+            .await
+            .unwrap();
+        assert_eq!(
+            clone.selection(),
+            (
+                Some("original@example.test".into()),
+                Some("original-tenant".into())
+            )
+        );
+        let expired =
+            synthetic_app_call(&clone, json!({"ok":false,"error":{"code":"AUTH_EXPIRED"}}))
+                .await
+                .unwrap();
+        assert_eq!(expired["error"]["code"], "AUTH_EXPIRED");
+        let error = synthetic_app_call(&clone, json!({"ok":true,"profile":changed}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "ACCOUNT_MISMATCH");
+        let recovered = synthetic_app_call(&app, json!({"ok":true,"profile":original}))
+            .await
+            .unwrap();
+        assert_eq!(recovered["profile"], original);
+    }
+}
+
+#[tokio::test]
+async fn first_failed_app_read_binds_the_known_account_and_tenant() {
+    let app = App::new(Config::default());
+    let original =
+        json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+    let changed =
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"});
+    let failed = synthetic_app_call_with(
+        &app,
+        json!({"action":"request"}),
+        json!({"ok":false,"profile":original,"error":{"code":"AUTH_EXPIRED"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed["error"]["code"], "AUTH_EXPIRED");
+    assert_eq!(
+        app.selection(),
+        (
+            Some("original@example.test".into()),
+            Some("original-tenant".into())
+        )
+    );
+    assert_eq!(
+        synthetic_app_call(&app, json!({"ok":true,"profile":changed}))
+            .await
+            .unwrap_err()
+            .code,
+        "ACCOUNT_MISMATCH"
+    );
+    assert_eq!(
+        synthetic_app_call(&app, json!({"ok":true,"profile":original}))
+            .await
+            .unwrap()["profile"],
+        original
+    );
+}
+
+async fn synthetic_app_call(
+    app: &App,
+    result: serde_json::Value,
+) -> Result<serde_json::Value, error::Failure> {
+    synthetic_app_call_with(app, json!({"action":"status"}), result).await
+}
+
+async fn synthetic_app_call_with(
+    app: &App,
+    input: serde_json::Value,
+    result: serde_json::Value,
+) -> Result<serde_json::Value, error::Failure> {
+    let mut invocation = 0;
+    app.evaluate_with(input, move |_| {
+        invocation += 1;
+        let value = if invocation == 1 {
+            json!({"ok":true,"targets":[{"windowId":17,"tabId":1}]})
+        } else {
+            result.clone()
+        };
+        std::future::ready(Ok(value.to_string()))
+    })
+    .await
 }
 
 #[test]

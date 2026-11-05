@@ -6,7 +6,7 @@ fn missing_headless_profile_requires_setup_without_launching_a_browser() {
     let profile = std::env::temp_dir().join(format!("teams-absent-{}", uuid::Uuid::new_v4()));
     let output = Command::new(env!("CARGO_BIN_EXE_teams-mcp"))
         .arg("--status")
-        .env_remove("TEAMS_AUTH_SOURCE")
+        .env("TEAMS_AUTH_SOURCE", "headless")
         .env("TEAMS_BROWSER_PROFILE", &profile)
         .env("TEAMS_BROWSER_BINARY", "/missing/browser")
         .env_remove("TEAMS_APP_WINDOW_ID")

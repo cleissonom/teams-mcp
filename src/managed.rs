@@ -6,7 +6,6 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -14,12 +13,15 @@ use std::{
 };
 use tokio::{
     process::{Child, Command},
-    sync::oneshot,
     time::{sleep, timeout},
 };
+mod activity;
+mod login;
 mod restore;
 mod selection;
 mod state;
+pub use activity::request_guard;
+pub use login::login;
 use state::{
     ERROR, FROZEN, HEARTBEAT, Running, START_TIMEOUT, STATE, STOP, State, idle_seconds, lock_file,
     log_event, modified, private_directory, profile, profile_in_use, read_small, running,
@@ -32,7 +34,6 @@ const TEAMS_ORIGINS: [&str; 2] = [
 ];
 /// Interactive setup windows close after this much connector inactivity.
 const SETUP_IDLE: Duration = Duration::from_secs(900);
-const LOGIN_WAIT: Duration = Duration::from_secs(900);
 /// Chrome features that download models or run services Teams does not use. Security
 /// components (Safe Browsing, certificate and CT updates) are deliberately left enabled.
 const DISABLED_FEATURES: &str = "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OptimizationHints,Translate,MediaRouter";
@@ -61,89 +62,6 @@ pub fn keepalive(config: &Config) -> Result<(), Failure> {
         write_private(&profile.join(HEARTBEAT), state.nonce.as_bytes())?;
     }
     Ok(())
-}
-
-pub async fn login(config: &Config, wait: bool) -> Result<Value, Failure> {
-    let config = session_config(config)?;
-    let profile = profile(&config)?;
-    private_directory(&profile)?;
-    let state = ensure(&config, &profile, true).await?;
-    if !wait {
-        return Ok(
-            json!({"started":true,"mode":"headed","message":"Complete normal Teams sign-in in the opened browser, then run teams-mcp auth stop. Ordinary calls will reuse this profile headlessly."}),
-        );
-    }
-    eprintln!(
-        "Complete normal Teams sign-in in the opened browser window. Waiting up to 15 minutes."
-    );
-    let (email, tenant) = await_signin(&config, &profile, &state).await?;
-    let saved = selection::save(&profile, email.clone(), tenant.clone());
-    let _startup = startup_lock(&profile).await?;
-    stop_worker(&profile, &state).await?;
-    Ok(
-        json!({"signedIn":true,"account":email,"tenant":tenant,"selectionSaved":saved,"stopped":true}),
-    )
-}
-
-/// Polls the headed setup browser until it is signed in. On a terminal, the owner
-/// confirms with Enter, so a guest can first switch to the intended organization.
-async fn await_signin(
-    config: &Config,
-    profile: &Path,
-    state: &State,
-) -> Result<(String, String), Failure> {
-    let interactive = std::io::stdin().is_terminal();
-    let deadline = Instant::now() + LOGIN_WAIT;
-    let mut announced = None;
-    let mut enter = interactive.then(read_line);
-    loop {
-        if worker_stopped(profile)? {
-            return Err(failure("AUTH_LOGIN_CLOSED"));
-        }
-        write_private(&profile.join(HEARTBEAT), state.nonce.as_bytes())?;
-        let identity = selection::identity(config, &state.endpoint).await;
-        let pressed = enter
-            .as_mut()
-            .is_some_and(|receiver| receiver.try_recv().is_ok());
-        match (&identity, interactive, pressed) {
-            (Some(current), false, _) | (Some(current), true, true) => return Ok(current.clone()),
-            (None, true, true) => {
-                eprintln!("Sign-in is not complete yet. Finish it in the browser window first.");
-            }
-            _ => {}
-        }
-        if pressed {
-            enter = Some(read_line());
-        }
-        if let Some(current) = identity
-            && announced.as_ref() != Some(&current)
-        {
-            eprintln!(
-                "Signed in as {} (tenant {}). Switch organization in the browser window if needed, then press Enter to save and close it.",
-                current.0, current.1
-            );
-            announced = Some(current);
-        }
-        if Instant::now() >= deadline {
-            return Err(failure("AUTH_LOGIN_TIMEOUT"));
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
-
-fn read_line() -> oneshot::Receiver<()> {
-    let (sender, receiver) = oneshot::channel();
-    // A detached thread: a pending terminal read must not delay process exit.
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        if std::io::stdin()
-            .read_line(&mut line)
-            .is_ok_and(|read| read > 0)
-        {
-            let _ = sender.send(());
-        }
-    });
-    receiver
 }
 
 pub async fn stop(config: &Config) -> Result<Value, Failure> {
@@ -201,14 +119,16 @@ pub fn status(config: &Config) -> Result<Value, Failure> {
         }
     }
     Ok(
-        json!({"setupComplete":profile.join("Default").is_dir(),"account":config.account,
-        "tenant":config.tenant,"profile":profile.display().to_string(),"browser":browser}),
+        json!({"setupComplete":profile.join("Default").is_dir(),"profileExists":profile.is_dir(),
+        "authentication":{"state":if activity::setup_pending(&profile)? || browser["mode"] == "headed" {"signing_in"} else if profile.join("Default").is_dir() {"unverified"} else {"sign_in_required"},"sessionVerified":false},
+        "account":config.account,"tenant":config.tenant,"profile":profile.display().to_string(),"browser":browser}),
     )
 }
 
 /// Clears only the Teams Service Worker cache through Chrome. Cookies, local storage
 /// and IndexedDB (where the sign-in lives) are untouched.
 pub async fn compact(config: &Config) -> Result<Value, Failure> {
+    let _activity = request_guard(config).await?;
     let endpoint = endpoint(config).await?;
     let cdp = Cdp::connect(&endpoint).await?;
     let session = teams_page_session(&cdp, config.target_id.as_deref()).await?;
@@ -827,11 +747,11 @@ fn failure(code: &str) -> Failure {
     let (code, message) = match code {
         "AUTH_SETUP_REQUIRED" => (
             code,
-            "Run teams-mcp auth login once to create the dedicated Teams browser session. No browser was started.",
+            "Run teams-mcp --auth-source headless auth login to create or renew the dedicated Teams browser session. No browser was started.",
         ),
         "BROWSER_BUSY" => (
             code,
-            "The managed browser is starting or running in another mode. Finish sign-in if needed, then run teams-mcp auth stop and retry.",
+            "The managed session is being prepared or explicit sign-in is in progress. Wait for it to finish, then retry the original request.",
         ),
         "BROWSER_PROFILE_IN_USE" => (
             code,
@@ -867,15 +787,15 @@ fn failure(code: &str) -> Failure {
         ),
         "BROWSER_STOP_TIMEOUT" => (
             code,
-            "The owned browser did not stop within ten seconds. Retry teams-mcp auth stop.",
+            "The owned browser did not stop within ten seconds. Retry teams-mcp --auth-source headless auth stop.",
         ),
         "AUTH_LOGIN_TIMEOUT" => (
             code,
-            "Sign-in did not complete within 15 minutes. The setup window was left open; finish sign-in, then run teams-mcp auth stop.",
+            "Sign-in did not complete within 15 minutes. The setup window was closed without changing the selected account or tenant; retry explicit sign-in when ready.",
         ),
         "AUTH_LOGIN_CLOSED" => (
             code,
-            "The setup browser closed before sign-in completed. Run teams-mcp auth login again.",
+            "The setup browser closed before sign-in completed. Run teams-mcp --auth-source headless auth login again.",
         ),
         "BROWSER_FREEZE_FAILED" => (
             code,

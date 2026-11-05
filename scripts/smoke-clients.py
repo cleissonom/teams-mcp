@@ -119,7 +119,17 @@ def run_client(client, source, binary, directory, protocol_only=False):
             process.kill()
             process.wait()
     if protocol_only:
-        passed = code == 0 and results.get("teams_status", {}).get("error", {}).get("code") == "AUTH_SETUP_REQUIRED"
+        error = results.get("teams_status", {}).get("error", {})
+        recovery = error.get("recovery", {})
+        passed = (
+            code == 0 and error.get("code") == "AUTH_SETUP_REQUIRED"
+            and error.get("authentication", {}).get("state") == "sign_in_required"
+            and recovery.get("authSource") == "headless"
+            and recovery.get("interactionRequired") is True
+            and recovery.get("command", {}).get("args") == ["--auth-source", "headless", "auth", "login"]
+            and recovery.get("verify") == {"tool": "teams_status", "arguments": {}}
+            and recovery.get("retry", {}).get("maxAttempts") == 1
+        )
     else:
         passed = code == 0 and all(results.get(name, {}).get("success") is True for name in TOOLS)
     print(json.dumps({"client": client, "source": source, "protocolOnly": protocol_only, "passed": passed}), flush=True)
@@ -127,17 +137,21 @@ def run_client(client, source, binary, directory, protocol_only=False):
 
 
 def report(client, source, name, value):
-    safe = {key: value[key] for key in ("success", "authSource", "capabilities", "returned", "error") if key in value}
+    safe = {key: value[key] for key in ("success", "authSource", "capabilities", "returned") if key in value}
+    if isinstance(value.get("error"), dict):
+        safe["error"] = {"code": value["error"].get("code")}
     print(json.dumps({"client": client, "source": source, "tool": name, **safe}), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", choices=("codex", "claude", "both"), default="both")
-    parser.add_argument("--source", choices=("headless", "browser", "app"), default="headless")
+    parser.add_argument("--source", choices=("headless", "browser", "app"), default="browser")
     parser.add_argument("--protocol-only", action="store_true", help="Verify client discovery and missing-auth errors without launching Chrome")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/teams-mcp")
     args = parser.parse_args()
+    if args.protocol_only:
+        args.source = "headless"
     if not args.binary.is_file():
         parser.error("Build the binary first: cargo build --release --locked")
     private = ROOT / ".private"

@@ -5,6 +5,8 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 pub use teams_mcp::{config, error};
+#[path = "../src/identity.rs"]
+mod identity;
 #[path = "support/readiness.rs"]
 mod readiness;
 
@@ -48,6 +50,11 @@ async fn reply(socket: &mut TestSocket, call: &Value, result: Value) {
 
 fn standard_result(method: &str) -> Value {
     match method {
+        "Target.createTarget" => json!({"targetId":"teams"}),
+        "Target.getTargetInfo" => {
+            json!({"targetInfo":{"targetId":"teams","type":"other","url":"https://teams.microsoft.com/v2/"}})
+        }
+        "Target.closeTarget" => json!({"success":true}),
         "Target.getTargets" => {
             json!({"targetInfos":[{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})
         }
@@ -452,6 +459,228 @@ fn hidden_browser(endpoint: String) -> Browser {
         tenant: Some("11111111-2222-4333-8444-555555555555".into()),
         ..Default::default()
     })
+}
+
+#[tokio::test]
+async fn browser_binding_survives_expiry_and_rejects_changed_account_or_tenant() {
+    for changed in [
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"}),
+        json!({"id":"original-user","email":"original@example.test","tenantId":"other-tenant"}),
+    ] {
+        let original = json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+        let outputs = vec![
+            json!({"ok":true,"profile":original}),
+            json!({"ok":false,"error":{"code":"AUTH_EXPIRED","message":"fixture"}}),
+            json!({"ok":true,"profile":changed}),
+            json!({"ok":true,"profile":original}),
+        ];
+        let (endpoint, server) = binding_fixture(outputs).await;
+        let browser = browser(endpoint);
+        let clone = browser.clone();
+        browser.evaluate(json!({"action":"status"})).await.unwrap();
+        assert_eq!(
+            clone.selection(),
+            (
+                Some("original@example.test".into()),
+                Some("original-tenant".into())
+            )
+        );
+        let expired = clone.evaluate(json!({"action":"status"})).await.unwrap();
+        assert_eq!(expired["error"]["code"], "AUTH_EXPIRED");
+        let error = clone
+            .evaluate(json!({"action":"status"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "ACCOUNT_MISMATCH");
+        let recovered = browser.evaluate(json!({"action":"status"})).await.unwrap();
+        assert_eq!(recovered["profile"], original);
+        drop((browser, clone));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn first_failed_browser_read_binds_the_known_account_and_tenant() {
+    let original =
+        json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+    let changed =
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"});
+    let (endpoint, peer) = binding_fixture(vec![
+        json!({"ok":false,"profile":original,"error":{"code":"AUTH_EXPIRED","message":"fixture"}}),
+        json!({"ok":true,"profile":changed}),
+        json!({"ok":true,"profile":original}),
+    ])
+    .await;
+    let browser = browser(endpoint);
+    let failed = browser.evaluate(json!({"action":"request"})).await.unwrap();
+    assert_eq!(failed["error"]["code"], "AUTH_EXPIRED");
+    assert_eq!(
+        browser.selection(),
+        (
+            Some("original@example.test".into()),
+            Some("original-tenant".into())
+        )
+    );
+    assert_eq!(
+        browser
+            .evaluate(json!({"action":"status"}))
+            .await
+            .unwrap_err()
+            .code,
+        "ACCOUNT_MISMATCH"
+    );
+    assert_eq!(
+        browser.evaluate(json!({"action":"status"})).await.unwrap()["profile"],
+        original
+    );
+    drop(browser);
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn first_failed_hidden_attempt_binds_identity_before_its_internal_retry() {
+    let original =
+        json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+    let changed =
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"});
+    let (endpoint, peer) = binding_fixture(vec![
+        json!({"ok":false,"profile":original,"error":{"code":"AUTH_REQUIRED","message":"fixture"}}),
+        json!({"ok":true,"profile":changed}),
+    ])
+    .await;
+    let browser = Browser::new(Config {
+        auth_source: config::AuthSource::Browser,
+        cdp_url: Some(endpoint),
+        hidden_tab: true,
+        ..Config::default()
+    });
+    assert_eq!(
+        browser
+            .evaluate(json!({"action":"request"}))
+            .await
+            .unwrap_err()
+            .code,
+        "ACCOUNT_MISMATCH"
+    );
+    assert_eq!(
+        browser.selection(),
+        (
+            Some("original@example.test".into()),
+            Some("original-tenant".into())
+        )
+    );
+    browser.release_hidden().await;
+    drop(browser);
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_browser_calls_cannot_replace_the_verified_identity() {
+    let original =
+        json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+    let changed =
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"});
+    let (endpoint, server) = binding_fixture(vec![
+        json!({"ok":true,"profile":original}),
+        json!({"ok":true,"profile":changed}),
+        json!({"ok":true,"profile":original}),
+    ])
+    .await;
+    let browser = browser(endpoint);
+    browser.evaluate(json!({"action":"status"})).await.unwrap();
+    let clone = browser.clone();
+    let (a, b) = tokio::join!(
+        browser.evaluate(json!({"action":"status"})),
+        clone.evaluate(json!({"action":"status"})),
+    );
+    let (success, failure) = if a.is_ok() { (a, b) } else { (b, a) };
+    assert_eq!(success.unwrap()["profile"], original);
+    assert_eq!(failure.unwrap_err().code, "ACCOUNT_MISMATCH");
+    assert_eq!(
+        clone.selection(),
+        (
+            Some("original@example.test".into()),
+            Some("original-tenant".into())
+        )
+    );
+    drop((browser, clone));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_binding_survives_a_reconnected_browser_endpoint() {
+    let original =
+        json!({"id":"original-user","email":"original@example.test","tenantId":"original-tenant"});
+    let changed =
+        json!({"id":"other-user","email":"other@example.test","tenantId":"original-tenant"});
+    let (first, first_server) = binding_fixture(vec![json!({"ok":true,"profile":original})]).await;
+    let (second, second_server) = binding_fixture(vec![json!({"ok":true,"profile":changed})]).await;
+    let path = std::env::temp_dir().join(format!("teams-binding-{}.port", uuid::Uuid::new_v4()));
+    select_fixture_endpoint(&path, &first).await;
+    let browser = Browser::new(Config {
+        auth_source: config::AuthSource::Browser,
+        port_file: Some(path.clone()),
+        ..Default::default()
+    });
+    browser.evaluate(json!({"action":"status"})).await.unwrap();
+    select_fixture_endpoint(&path, &second).await;
+    assert_eq!(
+        browser
+            .evaluate(json!({"action":"status"}))
+            .await
+            .unwrap_err()
+            .code,
+        "ACCOUNT_MISMATCH"
+    );
+    assert_eq!(
+        browser.selection(),
+        (
+            Some("original@example.test".into()),
+            Some("original-tenant".into())
+        )
+    );
+    drop(browser);
+    tokio::fs::remove_file(path).await.unwrap();
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+}
+
+async fn select_fixture_endpoint(path: &std::path::Path, endpoint: &str) {
+    let endpoint = url::Url::parse(endpoint).unwrap();
+    tokio::fs::write(
+        path,
+        format!("{}\n{}\n", endpoint.port().unwrap(), endpoint.path()),
+    )
+    .await
+    .unwrap();
+}
+
+async fn binding_fixture(outputs: Vec<Value>) -> (String, tokio::task::JoinHandle<()>) {
+    let (listener, endpoint) = listener("binding").await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        let original = outputs[0]["profile"].clone();
+        let mut calls = 0;
+        let mut outputs: std::collections::VecDeque<_> = outputs.into();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let call: Value = serde_json::from_str(&text).unwrap();
+            let result = if call["method"] == "Runtime.callFunctionOn" {
+                if calls > 0 {
+                    let input = &call["params"]["arguments"][0]["value"];
+                    assert_eq!(input["expectedAccount"], original["email"]);
+                    assert_eq!(input["tenantId"], original["tenantId"]);
+                }
+                calls += 1;
+                json!({"result":{"value":outputs.pop_front().expect("unexpected bridge call")}})
+            } else {
+                standard_result(call["method"].as_str().unwrap())
+            };
+            reply(&mut ws, &call, result).await;
+        }
+        assert!(outputs.is_empty());
+    });
+    (endpoint, server)
 }
 
 #[tokio::test]

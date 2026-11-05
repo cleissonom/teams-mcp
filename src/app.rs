@@ -1,4 +1,4 @@
-use crate::{config::Config, error::Failure};
+use crate::{config::Config, error::Failure, identity::IdentityBinding};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, future::Future, process::Stdio, time::Duration};
@@ -15,6 +15,7 @@ const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 #[derive(Clone)]
 pub struct App {
     config: Config,
+    identity: IdentityBinding,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -26,7 +27,14 @@ pub(crate) struct AppTarget {
 
 impl App {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            identity: IdentityBinding::default(),
+        }
+    }
+
+    pub fn selection(&self) -> (Option<String>, Option<String>) {
+        self.identity.selection(&self.config)
     }
 
     pub async fn evaluate(&self, input: Value) -> Result<Value, Failure> {
@@ -50,18 +58,19 @@ impl App {
         F: FnMut(String) -> Fut,
         Fut: Future<Output = Result<String, Failure>>,
     {
-        let args = input
-            .as_object_mut()
-            .ok_or_else(|| app_failure("APP_INVALID_INPUT"))?;
-        args.insert("nativeApp".into(), json!(true));
-        args.insert("expectedAccount".into(), json!(self.config.account));
-        args.insert("tenantId".into(), json!(self.config.tenant));
+        if !input.is_object() {
+            return Err(app_failure("APP_INVALID_INPUT"));
+        }
+        input["nativeApp"] = json!(true);
+        self.identity.apply(&self.config, &mut input)?;
         let inventory = parse_response(&run(inventory_script()).await?)?;
         let targets: Vec<AppTarget> = serde_json::from_value(inventory["targets"].clone())
             .map_err(|_| app_failure("APP_PROTOCOL_ERROR"))?;
         let target = select_target(&targets, self.config.app_window_id)?;
         let slot = format!("__teams_mcp_{}", uuid::Uuid::new_v4().simple());
-        parse_response(&run(execution_script(&target, &input, &slot)).await?)
+        let value = parse_response(&run(execution_script(&target, &input, &slot)).await?)?;
+        self.identity.check(&self.config, &value)?;
+        Ok(value)
     }
 }
 

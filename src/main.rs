@@ -2,6 +2,7 @@ use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use std::process::ExitCode;
 use teams_mcp::{
+    auth,
     config::Config,
     server::{TeamsServer, outcome},
 };
@@ -9,13 +10,16 @@ use teams_mcp::{
 const USAGE: &str = "Usage: teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version], or teams-mcp auth login [--no-wait]|stop|status|compact.";
 const HELP: &str = "teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version]
 
-teams-mcp auth login     Open the managed profile for normal Teams sign-in, wait for it, save the account and close the window.
-teams-mcp auth login --no-wait   Open the sign-in window and return immediately; finish with auth stop.
-teams-mcp auth stop      Close only this connector's managed browser, retaining its session.
-teams-mcp auth status    Show local setup and browser state without starting Chrome or contacting Teams.
-teams-mcp auth compact   Clear the Teams Service Worker cache in the managed profile; sign-in is kept.
+teams-mcp auth login     Guide and wait for normal sign-in in the selected existing browser or App.
+teams-mcp auth login --no-wait   Show guidance and check the existing session once.
+teams-mcp --auth-source headless auth login   Wait for active reads, open managed sign-in, save the selected account and close setup.
+teams-mcp --auth-source headless auth login --no-wait   Open managed setup and return; finish with --auth-source headless auth stop.
+teams-mcp --auth-source headless auth stop      Close only this connector's managed browser, retaining its session.
+teams-mcp auth status    Show local setup evidence; this does not verify authentication or API permissions.
+teams-mcp --auth-source headless auth compact   Clear the managed Teams Service Worker cache; sign-in is kept.
 
-No action: MCP over stdio. Default: managed headless Chrome, shared by MCP clients.
+No action: MCP over stdio. Default: existing browser with an approved debugging connection.
+Codex and Claude Code use the same error.recovery workflow. MCP OAuth login does not authenticate this stdio server.
 Common: TEAMS_AUTH_SOURCE, TEAMS_TRANSPORT (page|lease), TEAMS_ACCOUNT, TEAMS_TENANT_ID, TEAMS_REQUEST_TIMEOUT_SECS, TEAMS_MCP_LOG.
 Headless: TEAMS_BROWSER_PROFILE, TEAMS_BROWSER_BINARY, TEAMS_BROWSER (chrome|edge|chromium|brave),
   TEAMS_BROWSER_IDLE_SECS, TEAMS_BROWSER_FREEZE_SECS, TEAMS_BROWSER_CACHE_LIMIT_MB, TEAMS_BROWSER_LEAN, TEAMS_PREWARM.
@@ -49,7 +53,13 @@ async fn main() -> ExitCode {
         }
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let print = |result| print_result(result, pretty);
+    let recovery_config = config.clone();
+    let print = |result: Result<Value, teams_mcp::error::Failure>| {
+        print_result(
+            result.map_err(|error| auth::recover(error, &recovery_config)),
+            pretty,
+        )
+    };
     match args.as_slice() {
         ["__browser-worker", rest @ ..] => {
             let headed = match rest {
@@ -63,11 +73,11 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-        ["auth", "login"] => print(teams_mcp::managed::login(&config, true).await),
-        ["auth", "login", "--no-wait"] => print(teams_mcp::managed::login(&config, false).await),
-        ["auth", "stop"] => print(teams_mcp::managed::stop(&config).await),
-        ["auth", "status"] => print(teams_mcp::managed::status(&config)),
-        ["auth", "compact"] => print(teams_mcp::managed::compact(&config).await),
+        ["auth", "login"] => print(auth::cli::login(&config, true).await),
+        ["auth", "login", "--no-wait"] => print(auth::cli::login(&config, false).await),
+        ["auth", "stop"] => print(auth::cli::stop(&config).await),
+        ["auth", "status"] => print(auth::local_status(&config)),
+        ["auth", "compact"] => print(auth::cli::compact(&config).await),
         ["auth", ..] => {
             eprintln!(
                 "Usage: teams-mcp auth login [--no-wait]|stop|status|compact. See --help for session configuration."

@@ -26,12 +26,22 @@ tokens, signed-in profiles, Keychain data, message bodies or unredacted logs.
   sanitized errors, not tokens.
 - The managed profile is sensitive local data. Keep it outside the repository
   with owner-only access. Do not sync or email it. On a new computer, sign in
-  normally using `teams-mcp auth login`.
-- The connector remembers the selected email and tenant in a private metadata
-  file. These are identity metadata, not credentials, and are not release files.
+  normally using `teams-mcp --auth-source headless auth login` when selecting
+  managed Chrome. The default existing-browser source uses the owner's approved
+  browser session without copying its profile.
+- The managed connector remembers the selected email and tenant in a private
+  metadata file. These are identity metadata, not credentials, and are not release
+  files. Explicit source, account and tenant selection survives reauthentication;
+  expiry never selects another identity or authentication source automatically.
 - MCP initialization and tool discovery do not require authentication. Normal
   calls never open visible sign-in windows. Session renewal still depends on
   Microsoft; expiry can require explicit interactive sign-in.
+- Authentication recovery metadata contains setup and verification instructions,
+  never credentials. Codex and Claude Code may run explicit setup when the owner
+  has authorized sign-in, then verify the selected session and retry the read once.
+  Sign-in and MFA remain in the selected browser or App. An access denial is not a
+  request to bypass policy or repeatedly authenticate. Local setup status does not
+  establish authentication or remote API permission.
 - CDP endpoints are restricted to literal loopback addresses. Do not expose or
   forward the browser's debugging port. CDP grants powerful access to that local
   browser; this is not an isolation boundary against other software running as

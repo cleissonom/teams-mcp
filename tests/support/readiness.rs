@@ -80,8 +80,7 @@ async fn headless_login_redirects_require_explicit_setup_without_attaching_to_lo
         let (result, counts) = run(&[url], &[ready()], AuthSource::Headless).await;
         let error = result.unwrap_err();
         assert_eq!(error.code, "AUTH_SETUP_REQUIRED");
-        assert!(error.message.contains("auth stop"));
-        assert!(error.message.contains("auth login"));
+        assert!(error.message.contains("--auth-source headless auth login"));
         assert_eq!(counts.evaluations, 0);
     }
 }

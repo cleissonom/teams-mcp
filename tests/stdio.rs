@@ -93,6 +93,10 @@ async fn disconnected_handshake_with(source: &str, protocol: &str, transport: &s
     let response: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(response["id"], 3);
     assert_eq!(response["result"]["isError"], true);
+    let data: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(response["result"]["structuredContent"], data);
+    assert_eq!(data["error"]["recovery"]["authSource"], source);
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()

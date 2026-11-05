@@ -42,7 +42,7 @@ fn teams_targets_require_exact_https_origin() {
 fn auth_source_is_explicit_and_unknown_modes_are_rejected() {
     use teams_mcp::config::AuthSource;
     assert!("headless".parse::<AuthSource>().is_ok());
-    assert_eq!(format!("{:?}", AuthSource::default()), "Headless");
+    assert_eq!(AuthSource::default(), AuthSource::Browser);
     assert_eq!(
         "browser".parse::<AuthSource>().unwrap(),
         AuthSource::Browser

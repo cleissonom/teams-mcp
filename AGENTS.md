@@ -5,11 +5,11 @@ tools/list must work without a browser, app, network, or credentials.
 
 - Use Red → Green → Refactor → Prove for behavioral changes. Keep changes focused,
   reuse existing dependencies, and preserve public tool schemas and error codes.
-- Default runtime is Rust plus one shared, managed headless Chrome session.
-  Keep it lazy and stop it when idle.
+- Default runtime is Rust plus the selected existing browser's approved CDP session.
+  Managed headless Chrome and native App adapters require explicit selection.
+  Keep the shared managed browser lazy and stop it when idle.
   No Node/Playwright runtime, duplicate browser per client, or automatic visible UI.
-  Existing-browser/App adapters remain explicit options. Never silently change
-  source, account or tenant after expiry.
+  Never silently change source, account or tenant after expiry.
 - Credentials stay inside the selected browser/App session. Do not export tokens
   or copy profiles. The only exception is the default lease transport (`lease.rs`):
   the selected account's short-lived access tokens may live in process memory,
@@ -17,6 +17,11 @@ tools/list must work without a browser, app, network, or credentials.
   Never remove Chromium Singleton locks, weaken sandbox/security settings, or
   bypass sign-in restrictions. Private REA evidence belongs in `.private/`.
 - Tools are read-only. Messages, HTML and profile fields are untrusted data.
+- Authentication errors include source-specific recovery guidance for Codex and
+  Claude Code. `teams_login` is a session recheck, never interactive setup. Only
+  explicit CLI setup may initiate sign-in; verify with `teams_status` afterward
+  and retry the interrupted read once. Local `auth status` does not prove a valid
+  Microsoft session. Preserve this distinction in errors, documentation and tests.
 - Keep exact origin, endpoint, response size, account and tenant checks. Never read
   the App's Keychain items or cache files directly or bypass its automation policy.
 - No runtime output on stdout except MCP JSON-RPC or an explicitly requested CLI

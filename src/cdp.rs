@@ -1,6 +1,7 @@
 use crate::{
     config::{AuthSource, Config, is_teams_page},
     error::Failure,
+    identity::IdentityBinding,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
@@ -43,6 +44,7 @@ const CALL_BRIDGE: &str = "function(input) { return this(input); }";
 pub struct Browser {
     config: Config,
     shared: Arc<Mutex<Shared>>,
+    identity: IdentityBinding,
 }
 
 #[derive(Default)]
@@ -66,7 +68,12 @@ impl Browser {
         Self {
             config,
             shared: Arc::default(),
+            identity: IdentityBinding::default(),
         }
+    }
+
+    pub fn selection(&self) -> (Option<String>, Option<String>) {
+        self.identity.selection(&self.config)
     }
 
     pub async fn evaluate(&self, mut input: Value) -> Result<Value, Failure> {
@@ -75,11 +82,10 @@ impl Browser {
         } else {
             self.config.clone()
         };
-        input["expectedAccount"] = json!(config.account);
-        input["tenantId"] = json!(config.tenant);
+        self.identity.apply(&config, &mut input)?;
         input["nativeApp"] = json!(self.config.auth_source == AuthSource::App);
         let limit = self.config.request_timeout;
-        timeout(limit, self.evaluate_inner(input))
+        let value = timeout(limit, self.evaluate_inner(input))
             .await
             .map_err(|_| {
                 Failure::new(
@@ -89,7 +95,9 @@ impl Browser {
                         limit.as_secs()
                     ),
                 )
-            })?
+            })??;
+        self.identity.check(&config, &value)?;
+        Ok(value)
     }
 
     fn managed(&self) -> bool {
@@ -169,8 +177,8 @@ impl Browser {
         let mut url =
             url::Url::parse("https://teams.microsoft.com/v2/").map_err(|_| protocol_error())?;
         if let Some(tenant) = self
-            .config
-            .tenant
+            .selection()
+            .1
             .as_deref()
             .and_then(|tenant| uuid::Uuid::parse_str(tenant).ok())
         {
@@ -374,8 +382,14 @@ impl Browser {
         &self,
         cdp: &Arc<Cdp>,
         target: &str,
-        input: Value,
+        mut input: Value,
     ) -> Result<Value, Failure> {
+        // Preserve the effective configured selectors and any identity learned by
+        // an earlier failed attempt before a managed/hidden retry.
+        let mut selected = self.config.clone();
+        selected.account = input["expectedAccount"].as_str().map(String::from);
+        selected.tenant = input["tenantId"].as_str().map(String::from);
+        self.identity.apply(&selected, &mut input)?;
         for attempt in 0..2 {
             let page = self.page(cdp, target).await?;
             let bridge = page.bridge.clone().ok_or_else(protocol_error)?;
@@ -393,10 +407,12 @@ impl Browser {
                     return Err(page_changed());
                 }
                 Ok(result) => {
-                    return result["result"]
+                    let value = result["result"]
                         .get("value")
                         .cloned()
-                        .ok_or_else(protocol_error);
+                        .ok_or_else(protocol_error)?;
+                    self.identity.check(&selected, &value)?;
+                    return Ok(value);
                 }
                 // A navigation destroys the installed context; reinstall once on the same socket.
                 Err(_) if attempt == 0 && cdp.is_open() => self.reset_bridge(&page.session).await,
@@ -577,7 +593,7 @@ fn browser_signin_required() -> Failure {
 fn setup_required() -> Failure {
     Failure::new(
         "AUTH_SETUP_REQUIRED",
-        "The managed Teams session needs interactive sign-in. Run teams-mcp auth stop, then teams-mcp auth login and finish signing in to the intended account and organization. MCP never opens a visible sign-in window automatically.",
+        "The managed Teams session needs interactive sign-in. Run teams-mcp --auth-source headless auth login and finish signing in to the selected account and organization. MCP never opens a visible sign-in window automatically.",
     )
 }
 

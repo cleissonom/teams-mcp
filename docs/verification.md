@@ -1,5 +1,43 @@
 # Verification record
 
+## Authentication recovery and existing-browser default
+
+2026-11-05, macOS. Existing-browser authentication is now the default; lease
+transport remains the default. Managed profiles require `--auth-source headless`.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed. |
+| `cargo test --locked` | Passed: 131 Rust tests. |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed. |
+| `node --test tests/bridge.cjs` | Passed: 28 bridge tests. |
+| `python3 -m unittest discover -s tests -p 'test_*.py'` | Passed: 9 tests, including release-manifest parity and private-error reporting. |
+| `cargo build --release --locked` | Passed. |
+| `python3 scripts/smoke-clients.py --protocol-only` | Passed in installed Codex and Claude Code clients using temporary MCP configurations. Both received the expected error code, source, setup arguments, verification tool and single-retry guidance. |
+
+Observed Red failures before their fixes: missing recovery metadata and structured
+MCP content; the old headless default; browser/App login entering managed setup;
+`BROWSER_BUSY` when switching an owned headless browser to setup; a setup-blocked
+read recommending another login; hidden-target closure during concurrent reads;
+missing recovery on partial unread results; and account changes accepted after
+expiry, including the first failed page read and an internal readiness retry.
+
+Regression coverage includes source-specific CLI setup, local setup versus verified
+session status, permission denials, successful setup followed by the original read,
+SIGINT/SIGTERM cancellation, active and queued reads across processes, and account
+and tenant preservation. Existing input schemas and error codes remain intact.
+Cancellation during managed browser startup waits for the owned startup transition
+to settle before closing setup. Independent review findings were fixed and reviewed
+again without outstanding findings.
+
+No interactive Microsoft sign-in was completed or live Teams API reads verified
+for this change. Before the CLI source fix, an initial regression test briefly
+opened the existing managed setup profile; its connector-owned worker was stopped
+without saving a selection. The test was corrected to use an isolated missing
+profile and nonexistent browser executable. Subsequent verification uses synthetic
+sessions; the client smoke test intentionally has no authentication. Linux/Windows
+runtime behavior and organization-specific sign-in policies were not live-tested.
+
 ## Lease transport (branch `perf/token-lease`)
 
 2026-11-04, same Mac and account; read-only calls, metadata-only reports. Lease is

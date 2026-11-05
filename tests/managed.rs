@@ -1,5 +1,8 @@
 #[path = "support/managed_browser.rs"]
 mod fake_browser;
+#[cfg(unix)]
+#[path = "support/managed_recovery.rs"]
+mod recovery;
 use futures_util::SinkExt;
 use serde_json::{Value, json};
 use std::{
@@ -50,6 +53,7 @@ impl Fixture {
     }
     fn config(&self) -> Config {
         Config {
+            auth_source: teams_mcp::config::AuthSource::Headless,
             browser_profile: Some(self.profile.clone()),
             browser_binary: Some(self.browser.clone()),
             ..Default::default()
@@ -79,6 +83,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_teams-mcp"))
             .args(["auth", "stop"])
+            .env("TEAMS_AUTH_SOURCE", "headless")
             .env("TEAMS_BROWSER_PROFILE", &self.profile)
             .env("TEAMS_BROWSER_BINARY", &self.browser)
             .stdout(std::process::Stdio::null())
@@ -349,6 +354,9 @@ async fn offline_status_reports_state_without_launching_a_browser() {
     status.args(["auth", "status"]);
     let result = output(status).await;
     assert_eq!(result["setupComplete"], true);
+    assert_eq!(result["profileExists"], true);
+    assert_eq!(result["authentication"]["state"], "unverified");
+    assert_eq!(result["authentication"]["sessionVerified"], false);
     assert_eq!(result["browser"]["state"], "stopped");
     assert!(
         !fixture.root.join("args").exists(),
@@ -430,7 +438,13 @@ async fn compact_clears_only_teams_cache_storage_through_chrome() {
 #[cfg(unix)]
 async fn default_lease_transport_mints_then_stops_the_browser_soon() {
     let fixture = Fixture::new(true);
-    fs::write(fixture.profile.join("fixture-bridge-response"),json!({"ok":true,"profile":{"id":"fixture-user","tenantId":"22222222-2222-4222-8222-222222222222"},"lease":{"spaces":{"token":"fixture-spaces","expiresAt":4102444800u64}}}).to_string()).unwrap();
+    fs::write(fixture.profile.join("fixture-bridge-response"),json!({"ok":true,"profile":{"id":"fixture-user","tenantId":"22222222-2222-4222-8222-222222222222"},"capabilities":{"chat":true},"lease":{"spaces":{"token":"fixture-spaces","expiresAt":4102444800u64}}}).to_string()).unwrap();
+    let mut mint = fixture.command();
+    mint.env_remove("TEAMS_TRANSPORT")
+        .args(["--call", "teams_get_me", "{}"]);
+    let minted = output(mint).await;
+    assert_eq!(minted["profile"]["id"], "fixture-user");
+    assert!(!minted.to_string().contains("fixture-spaces"));
     let mut call = fixture.command();
     call.env_remove("TEAMS_TRANSPORT").arg("--status");
     let result = output(call).await;

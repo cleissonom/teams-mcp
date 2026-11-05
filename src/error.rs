@@ -4,6 +4,10 @@ use serde::Serialize;
 pub struct Failure {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<crate::auth::Authentication>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<Box<crate::auth::Recovery>>,
 }
 
 impl Failure {
@@ -11,6 +15,8 @@ impl Failure {
         Self {
             code: code.into(),
             message: message.into(),
+            authentication: None,
+            recovery: None,
         }
     }
 }

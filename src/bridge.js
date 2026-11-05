@@ -290,11 +290,13 @@
             return results;
         }
 
+        let selectedProfile;
         try {
             if (!origins.includes(location.origin)) fail('WRONG_ORIGIN', 'The selected tab is no longer a supported Teams page.');
             const view = storageView();
             const tokens = [...await readTokens(view), ...await readTeamsTokens(view)];
             const auth = selectAccount(tokens, view);
+            selectedProfile = auth.profile;
             if (input.action === 'status' || input.action === 'profile') {
                 return {ok:true, profile:auth.profile, capabilities:{search:!!auth.search, chat:!!auth.spaces, channels:!!auth.csa && !!auth.spaces}};
             }
@@ -309,7 +311,7 @@
             return {ok:true, profile:auth.profile, data: await perform(input.request, view, auth)};
         } catch (error) {
             // Never return exception text: browser/network errors may contain credentials or private content.
-            return {ok:false, error:failures.has(error) ? {code:error.code,message:error.message} : {code:'SESSION_UNAVAILABLE', message:'Teams session data is unavailable. Finish loading or signing in to Teams, then retry.'}};
+            return {ok:false, ...(selectedProfile ? {profile:selectedProfile} : {}), error:failures.has(error) ? {code:error.code,message:error.message} : {code:'SESSION_UNAVAILABLE', message:'Teams session data is unavailable. Finish loading or signing in to Teams, then retry.'}};
         }
     };
 })()

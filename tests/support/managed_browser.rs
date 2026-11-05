@@ -58,6 +58,12 @@ pub async fn run() {
                     let Ok(mut ws)=tokio_tungstenite::accept_async(socket).await else{return};
                     while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))=ws.next().await {
                         let request:Value=serde_json::from_str(&text).unwrap();
+                        if request["method"] == "Runtime.callFunctionOn" && profile.join("fixture-hold-requests").exists() {
+                            fs::write(profile.join("fixture-request-started"), "started").unwrap();
+                            while profile.join("fixture-hold-requests").exists() {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                        }
                         let stop=request["method"]=="Browser.close";
                         let response=fs::read_to_string(profile.join("fixture-bridge-response")).ok().and_then(|text|serde_json::from_str::<Value>(&text).ok());
                         let record=|name:&str,line:&str|{let _=writeln!(fs::OpenOptions::new().create(true).append(true).open(profile.join(name)).unwrap(),"{line}");};

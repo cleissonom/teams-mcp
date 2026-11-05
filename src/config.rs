@@ -3,10 +3,20 @@ use url::Url;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub enum AuthSource {
-    #[default]
     Headless,
+    #[default]
     Browser,
     App,
+}
+
+impl AuthSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Headless => "headless",
+            Self::Browser => "browser",
+            Self::App => "app",
+        }
+    }
 }
 
 impl std::str::FromStr for AuthSource {
@@ -136,7 +146,7 @@ impl Config {
         };
         Ok(Self {
             auth_source: env::var("TEAMS_AUTH_SOURCE")
-                .unwrap_or_else(|_| "headless".into())
+                .unwrap_or_else(|_| "browser".into())
                 .parse()?,
             browser_binary: env::var_os("TEAMS_BROWSER_BINARY").map(PathBuf::from),
             browser_profile: env::var_os("TEAMS_BROWSER_PROFILE").map(PathBuf::from),

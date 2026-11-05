@@ -54,6 +54,23 @@ test('search fetch stays in browser and does not leak error response body',async
  const result=await run({action:'request',request:{service:'substrate',path:'/searchservice/api/v2/query',method:'POST',query:[],body:{entityRequests:[]}}});
  assert.equal(calls,1);assert.equal(result.error.code,'AUTH_EXPIRED');assert.ok(!JSON.stringify(result).includes(token.secret));
 });
+test('failed reads retain only the selected profile for identity binding',async()=>{
+ for (const [status,code] of [[401,'AUTH_EXPIRED'],[403,'ACCESS_DENIED']]) {
+  const run=environment({[cacheKey]:JSON.stringify(token)},'',async()=>new Response('private-upstream-body',{status}));
+  const result=await run({action:'request',request:{service:'substrate',path:'/searchservice/api/v2/query',method:'POST',query:[],body:{}}});
+  assert.equal(result.ok,false);assert.equal(result.error.code,code);
+  assert.equal(result.profile?.id,'user-one');assert.equal(result.profile.tenantId,'tenant-one');
+  assert.equal(result.profile.email,'tester@example.test');
+  assert.ok(!JSON.stringify(result).includes(token.secret));assert.ok(!JSON.stringify(result).includes('private-upstream-body'));
+  assert.equal(result.lease,undefined);assert.equal(result.data,undefined);
+ }
+});
+test('failures before account selection do not invent a selected profile',async()=>{
+ for (const run of [environment({}),environment({},'',undefined,'https://attacker.test')]) {
+  const result=await run({action:'status'});
+  assert.equal(result.ok,false);assert.equal(result.profile,undefined);
+ }
+});
 
 test('reuses Teams encrypted resource cache in browser and desktop webviews',async()=>{
  const key=Buffer.alloc(32,4),iv=Buffer.alloc(16,2);
