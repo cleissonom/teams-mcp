@@ -77,6 +77,23 @@ scanning/push protection where available. Repository creation, publication and
 client registration are separate actions; the packaging script performs none of
 them.
 
+## Release versioning
+
+The MCP server and its tools share the semantic version in `Cargo.toml`, starting
+with `0.1.0`. The CLI's `--version` result and MCP server metadata use that version.
+Git tags use `vMAJOR.MINOR.PATCH`, such as `v0.1.0`, and must match the package version.
+
+For each release:
+
+1. Update the package version and its `Cargo.lock` entry when needed. Run the
+   development checks and the source-archive verification above.
+2. Commit the release changes to `main`, create an annotated tag on that commit,
+   and push the branch and tag. The tag starts the release-binary workflow for
+   macOS Apple Silicon, macOS Intel and Linux x86-64.
+3. Create a draft GitHub release from the existing tag, with release notes and the
+   reviewed source ZIP plus its SHA-256 checksum. Let the workflow attach platform
+   binaries and their checksums before publishing the completed release.
+
 ## License and attribution
 
 By contributing, you agree that your contributions are distributed under this

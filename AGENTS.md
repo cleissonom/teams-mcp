@@ -31,6 +31,9 @@ tools/list must work without a browser, app, network, or credentials.
 - Public source archives use `release-files.txt`. Never add credentials, signed-in
   profiles, raw network captures, private investigation artifacts or build outputs
   to that manifest. Examples must use synthetic identities and portable paths.
+- Release the MCP server and its tools together using the semantic version in
+  `Cargo.toml` and matching annotated `vMAJOR.MINOR.PATCH` tags from `main`.
+  Follow `CONTRIBUTING.md` for source-archive verification and release publication.
 
 Verification from this directory:
 

@@ -162,7 +162,7 @@ fn classification(code: &str) -> Option<(&'static str, &'static str)> {
 pub fn signin_instructions(source: AuthSource) -> &'static str {
     match source {
         AuthSource::Browser => {
-            "In the selected existing browser, open Teams and sign in to the intended account and organization. Enable its approved remote debugging connection (Chrome: chrome://inspect/#remote-debugging) and approve the connection prompt. This command waits for that session; it does not open a managed browser or complete SSO/MFA for you."
+            "Enable the selected existing browser's approved remote debugging connection (Chrome: chrome://inspect/#remote-debugging) and approve the connection prompt. Explicit auth login opens Teams if no Teams tab is available, then waits for sign-in to the intended account and organization. Complete normal SSO/MFA in that browser. With --no-wait, it only checks the existing session once."
         }
         AuthSource::App => {
             "Open the selected Microsoft Teams App and sign in to the intended account and organization. For Apple Events, use the App's available Allow JavaScript from Apple Events setting and macOS Automation permission; for App CDP, use its approved endpoint. If policy disables automation, stop and report the restriction. This command waits for that App session and never falls back to a browser."

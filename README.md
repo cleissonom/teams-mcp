@@ -21,14 +21,18 @@ teams-mcp --status
 ```
 
 Run these commands from the extracted source directory or your Git clone.
-`cargo install` places the binary at `~/.cargo/bin/teams-mcp`; tagged releases also
-publish prebuilt macOS and Linux binaries. Building requires Rust 1.89+.
+`cargo install` places the binary at `~/.cargo/bin/teams-mcp`;
+[versioned releases](https://github.com/cleissonom/teams-mcp/releases) also publish
+prebuilt macOS and Linux binaries. Run `teams-mcp --version` to check the installed
+version. Building requires Rust 1.89+.
 
-For the default existing-browser source, open Teams in your intended Chrome
-session, enable remote debugging at `chrome://inspect/#remote-debugging`, and
-approve the connector's connection. `auth login` explains the selected source's
-setup and waits for a usable Teams session; complete sign-in and MFA in that
-browser. It never starts managed Chrome or copies your browser profile.
+For the default existing-browser source, enable remote debugging in your intended
+Chrome session at `chrome://inspect/#remote-debugging`, run `auth login`, and
+approve the connector's connection. The command reuses an existing Teams tab or
+opens one, then waits for a usable session; complete sign-in and MFA in that
+browser. `auth login --no-wait` only checks the existing session once. It never
+starts managed Chrome or copies your browser profile. An explicit `TEAMS_TARGET_ID`
+must still identify an existing Teams tab.
 See [authentication sources](#authentication-sources) for endpoint selection and
 the managed headless and native App alternatives.
 
@@ -129,9 +133,12 @@ new approval. See [Chrome's existing-session workflow](https://developer.chrome.
 
 Only `https://teams.microsoft.com` and `https://teams.cloud.microsoft` are eligible.
 On macOS the normal Chrome `DevToolsActivePort` file is discovered automatically.
-`TEAMS_CDP_PORT_FILE` selects another file; `TEAMS_CDP_URL` accepts only a literal
-loopback browser WebSocket endpoint. Use `TEAMS_TARGET_ID` when more than one
-eligible Teams tab exists.
+When no port file is found, the default Chrome source requests its approved
+connection at `ws://127.0.0.1:9222/devtools/browser`; Chrome still requires your
+connection approval. `TEAMS_CDP_PORT_FILE` selects another file; `TEAMS_CDP_URL`
+accepts only a literal loopback browser WebSocket endpoint. Explicit endpoints,
+port files and other browser selections never fall back to that default address.
+Use `TEAMS_TARGET_ID` when more than one eligible Teams tab exists.
 
 `--auth-source headless` uses one shared, managed Chrome profile across MCP clients.
 It requires an installed Chrome, Edge, Chromium or Brave, discovered at its normal

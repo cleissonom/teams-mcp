@@ -3,7 +3,10 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use teams_mcp::{
@@ -20,6 +23,11 @@ struct Fixture {
     endpoint: String,
     response: Arc<Mutex<Value>>,
     calls: Arc<Mutex<Vec<Value>>>,
+    targets: Arc<Mutex<Vec<Value>>>,
+    created: Arc<Mutex<Vec<Value>>>,
+    connections: Arc<AtomicUsize>,
+    fail_install: Arc<AtomicBool>,
+    fail_origin: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -32,17 +40,36 @@ impl Fixture {
         );
         let response = Arc::new(Mutex::new(bridge_response(code)));
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(vec![
+            json!({"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}),
+        ]));
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let fail_install = Arc::new(AtomicBool::new(false));
+        let fail_origin = Arc::new(AtomicBool::new(false));
         let (state, requests) = (response.clone(), calls.clone());
+        let (pages, creations, accepted) = (targets.clone(), created.clone(), connections.clone());
+        let installation = fail_install.clone();
+        let origin_change = fail_origin.clone();
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let (state, requests) = (state.clone(), requests.clone());
+                let (pages, creations) = (pages.clone(), creations.clone());
+                let installation = installation.clone();
+                let origin_change = origin_change.clone();
                 tokio::spawn(async move {
                     let mut socket = accept_async(socket).await.unwrap();
                     while let Some(Ok(Message::Text(text))) = socket.next().await {
                         let call: Value = serde_json::from_str(&text).unwrap();
                         let result = match call["method"].as_str().unwrap() {
                             "Target.getTargets" => {
-                                json!({"targetInfos":[{"targetId":"teams","type":"page","url":"https://teams.microsoft.com/v2/"}]})
+                                json!({"targetInfos":*pages.lock().unwrap()})
+                            }
+                            "Target.createTarget" => {
+                                creations.lock().unwrap().push(call["params"].clone());
+                                pages.lock().unwrap().push(json!({"targetId":"created-teams","type":"page","url":call["params"]["url"]}));
+                                json!({"targetId":"created-teams"})
                             }
                             "Target.attachToTarget" => json!({"sessionId":"session"}),
                             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"root"}}}),
@@ -52,6 +79,9 @@ impl Fixture {
                                 let input = call["params"]["arguments"][0]["value"].clone();
                                 requests.lock().unwrap().push(input.clone());
                                 let mut response = state.lock().unwrap().clone();
+                                if origin_change.swap(false, Ordering::SeqCst) {
+                                    response = bridge_response(Some("WRONG_ORIGIN"));
+                                }
                                 if input["action"] == "batch" && response.get("_batch").is_some() {
                                     response["data"] = response["_batch"].take();
                                 }
@@ -59,10 +89,15 @@ impl Fixture {
                             }
                             _ => json!({}),
                         };
+                        let response = if call["method"] == "Page.createIsolatedWorld"
+                            && installation.swap(false, Ordering::SeqCst)
+                        {
+                            json!({"id":call["id"],"error":{"code":-32000,"message":"Frame navigated during setup."}})
+                        } else {
+                            json!({"id":call["id"],"result":result})
+                        };
                         if socket
-                            .send(Message::Text(
-                                json!({"id":call["id"],"result":result}).to_string().into(),
-                            ))
+                            .send(Message::Text(response.to_string().into()))
                             .await
                             .is_err()
                         {
@@ -76,6 +111,11 @@ impl Fixture {
             endpoint,
             response,
             calls,
+            targets,
+            created,
+            connections,
+            fail_install,
+            fail_origin,
             task,
         }
     }
@@ -194,6 +234,71 @@ async fn browser_is_the_cli_default_without_creating_a_managed_profile() {
     assert_eq!(result["error"]["code"], "BROWSER_UNAVAILABLE");
     assert_eq!(result["error"]["recovery"]["authSource"], "browser");
     assert!(!profile.exists());
+}
+
+#[tokio::test]
+async fn browser_login_uses_chromes_approval_endpoint_without_a_guid() {
+    let fixture = Fixture::new(None).await;
+    let mut command = cli();
+    command
+        .args(["auth", "login", "--no-wait"])
+        .env("TEAMS_TRANSPORT", "page")
+        .env(
+            "TEAMS_CDP_URL",
+            fixture.endpoint.trim_end_matches("/recovery"),
+        )
+        .env("TEAMS_ACCOUNT", ACCOUNT)
+        .env("TEAMS_TENANT_ID", TENANT);
+    let result = output(command).await;
+    assert_eq!(result["success"], true, "{result}");
+    assert_eq!(result["signedIn"], true);
+    assert_eq!(result["authentication"]["sessionVerified"], true);
+    assert_eq!(result["authSource"], "existing-browser");
+    assert!(fixture.created.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_browser_login_opens_missing_teams_tab_on_the_same_connection() {
+    for (fail_install, fail_origin) in [(false, false), (true, false), (false, true)] {
+        let fixture = Fixture::new(None).await;
+        fixture.targets.lock().unwrap().clear();
+        fixture.fail_install.store(fail_install, Ordering::SeqCst);
+        fixture.fail_origin.store(fail_origin, Ordering::SeqCst);
+        let mut command = cli();
+        command
+            .args(["auth", "login"])
+            .env("TEAMS_TRANSPORT", "page")
+            .env("TEAMS_CDP_URL", &fixture.endpoint)
+            .env("TEAMS_ACCOUNT", ACCOUNT)
+            .env("TEAMS_TENANT_ID", TENANT);
+        let result = output(command).await;
+        assert_eq!(result["signedIn"], true, "{result}");
+        let created = fixture.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["hidden"], false);
+        assert_eq!(
+            created[0]["url"],
+            format!("https://teams.microsoft.com/v2/?tenantId={TENANT}")
+        );
+        assert_eq!(fixture.connections.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn missing_tab_status_and_no_wait_login_never_open_a_browser_tab() {
+    let fixture = Fixture::new(None).await;
+    fixture.targets.lock().unwrap().clear();
+    let server = TeamsServer::new(fixture.config(AuthSource::Browser));
+    for tool in ["teams_status", "teams_login"] {
+        let error = server.execute(tool, json!({})).await.unwrap_err();
+        assert_eq!(error.code, "TEAMS_TAB_REQUIRED");
+    }
+    let mut command = cli();
+    command
+        .args(["auth", "login", "--no-wait"])
+        .env("TEAMS_CDP_URL", &fixture.endpoint);
+    assert_eq!(output(command).await["error"]["code"], "TEAMS_TAB_REQUIRED");
+    assert!(fixture.created.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

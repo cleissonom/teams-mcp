@@ -1,6 +1,8 @@
 use std::{env, path::PathBuf, time::Duration};
 use url::Url;
 
+const CHROME_APPROVAL_ENDPOINT: &str = "ws://127.0.0.1:9222/devtools/browser";
+
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub enum AuthSource {
     Headless,
@@ -220,12 +222,25 @@ impl Config {
         let file = self
             .port_file
             .clone()
-            .or_else(|| default_port_file(self.browser))
-            .ok_or("Set TEAMS_CDP_URL or TEAMS_CDP_PORT_FILE for the existing browser.")?;
-        let content = tokio::fs::read_to_string(file).await
-            .map_err(|_| "Cannot read DevToolsActivePort. Enable remote debugging in the existing Chrome browser.")?;
-        endpoint_from_port_file(&content)
+            .or_else(|| default_port_file(self.browser));
+        browser_endpoint(file, self.browser).await
     }
+}
+
+async fn browser_endpoint(
+    file: Option<PathBuf>,
+    browser: Option<BrowserKind>,
+) -> Result<String, String> {
+    let Some(file) = file else {
+        // Chrome's approval mode defaults to 9222 and does not require a browser GUID.
+        return match browser {
+            None | Some(BrowserKind::Chrome) => Ok(CHROME_APPROVAL_ENDPOINT.into()),
+            _ => Err("Cannot find DevToolsActivePort for the selected browser. Set TEAMS_CDP_URL or TEAMS_CDP_PORT_FILE for that browser.".into()),
+        };
+    };
+    let content = tokio::fs::read_to_string(file).await
+        .map_err(|_| "Cannot read DevToolsActivePort. Check the selected port file and the existing browser's remote debugging connection.")?;
+    endpoint_from_port_file(&content)
 }
 
 fn seconds(name: &str, min: u64, max: u64) -> Result<Option<u64>, String> {
@@ -286,15 +301,10 @@ fn browser_data_directories(kind: Option<BrowserKind>) -> Vec<PathBuf> {
 }
 
 fn default_port_file(kind: Option<BrowserKind>) -> Option<PathBuf> {
-    let candidates: Vec<_> = browser_data_directories(kind)
+    browser_data_directories(kind)
         .into_iter()
         .map(|directory| directory.join("DevToolsActivePort"))
-        .collect();
-    candidates
-        .iter()
         .find(|path| path.is_file())
-        .or_else(|| candidates.first())
-        .cloned()
 }
 
 pub fn validate_endpoint(endpoint: &str) -> Result<String, String> {
@@ -308,13 +318,14 @@ pub fn validate_endpoint(endpoint: &str) -> Result<String, String> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !url.path().starts_with("/devtools/browser/")
-        || url
-            .path()
-            .trim_start_matches("/devtools/browser/")
-            .is_empty()
+        || !(url.path() == "/devtools/browser"
+            || (url.path().starts_with("/devtools/browser/")
+                && !url
+                    .path()
+                    .trim_start_matches("/devtools/browser/")
+                    .is_empty()))
     {
-        return Err("CDP requires a literal loopback ws:// address with a port and /devtools/browser/ID path.".into());
+        return Err("CDP requires a literal loopback ws:// address with a port and /devtools/browser or /devtools/browser/ID path.".into());
     }
     Ok(url.to_string())
 }
@@ -348,6 +359,32 @@ pub fn is_teams_page(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_automatic_chrome_port_file_uses_the_approval_endpoint() {
+        for browser in [None, Some(BrowserKind::Chrome)] {
+            let endpoint = browser_endpoint(None, browser).await.unwrap();
+            assert_eq!(endpoint, CHROME_APPROVAL_ENDPOINT);
+            assert!(validate_endpoint(&endpoint).is_ok());
+        }
+        for browser in [BrowserKind::Edge, BrowserKind::Chromium, BrowserKind::Brave] {
+            assert!(browser_endpoint(None, Some(browser)).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_port_file_errors_never_fall_back_to_chrome() {
+        let path = env::temp_dir().join(format!("teams-cdp-port-{}", uuid::Uuid::new_v4()));
+        assert!(browser_endpoint(Some(path.clone()), None).await.is_err());
+        std::fs::write(&path, "invalid").unwrap();
+        assert!(browser_endpoint(Some(path.clone()), None).await.is_err());
+        std::fs::write(&path, "9333\n/devtools/browser/selected\n").unwrap();
+        assert_eq!(
+            browser_endpoint(Some(path.clone()), None).await.unwrap(),
+            "ws://127.0.0.1:9333/devtools/browser/selected"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn lease_is_the_default_transport_and_page_remains_selectable() {

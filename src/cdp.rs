@@ -76,6 +76,23 @@ impl Browser {
         self.identity.selection(&self.config)
     }
 
+    /// Called only by explicit CLI login after the selected browser grants access.
+    pub(crate) async fn open_login_tab(&self) -> Result<(), Failure> {
+        let cdp = self.connection().await?;
+        let targets = cdp.call("Target.getTargets", json!({}), None).await?;
+        match select_target(&targets, self.config.target_id.as_deref()) {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.code == "TEAMS_TAB_REQUIRED"
+                    && self.config.auth_source == AuthSource::Browser
+                    && self.config.target_id.is_none() =>
+            {
+                self.create_teams_target(&cdp, false).await.map(|_| ())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn evaluate(&self, mut input: Value) -> Result<Value, Failure> {
         let config = if self.config.auth_source == AuthSource::Headless {
             crate::managed::session_config(&self.config)?
@@ -174,6 +191,12 @@ impl Browser {
             }
             shared.hidden = None;
         }
+        let target = self.create_teams_target(cdp, true).await?;
+        shared.hidden = Some(target.clone());
+        Ok(target)
+    }
+
+    async fn create_teams_target(&self, cdp: &Cdp, hidden: bool) -> Result<String, Failure> {
         let mut url =
             url::Url::parse("https://teams.microsoft.com/v2/").map_err(|_| protocol_error())?;
         if let Some(tenant) = self
@@ -188,16 +211,14 @@ impl Browser {
         let created = cdp
             .call(
                 "Target.createTarget",
-                json!({"url":url.as_str(),"hidden":true}),
+                json!({"url":url.as_str(),"hidden":hidden}),
                 None,
             )
             .await?;
-        let target = created["targetId"]
+        created["targetId"]
             .as_str()
-            .ok_or_else(protocol_error)?
-            .to_owned();
-        shared.hidden = Some(target.clone());
-        Ok(target)
+            .map(String::from)
+            .ok_or_else(protocol_error)
     }
 
     /// Closes the connector-owned hidden target, freeing its memory in the existing browser.

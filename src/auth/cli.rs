@@ -35,8 +35,10 @@ async fn await_existing(config: &Config, wait: bool) -> Result<Value, Failure> {
     let server = TeamsServer::new(config.clone());
     let deadline = Instant::now() + LOGIN_WAIT;
     let mut last_code = None;
+    let mut open_browser_tab =
+        wait && config.auth_source == AuthSource::Browser && config.target_id.is_none();
     loop {
-        let result = timeout_at(deadline, server.execute("teams_status", json!({}))).await;
+        let result = timeout_at(deadline, check_existing(&server, &mut open_browser_tab)).await;
         match result {
             Ok(Ok(mut status)) => {
                 status["signedIn"] = json!(true);
@@ -63,6 +65,26 @@ async fn await_existing(config: &Config, wait: bool) -> Result<Value, Failure> {
     }
 }
 
+async fn check_existing(
+    server: &TeamsServer,
+    open_browser_tab: &mut bool,
+) -> Result<Value, Failure> {
+    let status = server.execute("teams_status", json!({})).await;
+    let missing_tab = status.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.code.as_str(),
+            "TEAMS_TAB_REQUIRED" | "BROWSER_SIGNIN_REQUIRED"
+        )
+    });
+    if *open_browser_tab && missing_tab {
+        // Try once: a closed setup tab or a lost response must not open duplicates.
+        *open_browser_tab = false;
+        server.open_browser_login_tab().await?;
+        return server.execute("teams_status", json!({})).await;
+    }
+    status
+}
+
 fn waitable(code: &str) -> bool {
     matches!(
         code,
@@ -73,7 +95,9 @@ fn waitable(code: &str) -> bool {
             | "TEAMS_TAB_REQUIRED"
             | "BROWSER_UNAVAILABLE"
             | "BROWSER_TIMEOUT"
+            | "BROWSER_PROTOCOL_ERROR"
             | "PAGE_CHANGED"
+            | "WRONG_ORIGIN"
             | "APP_NOT_RUNNING"
             | "APP_TEAMS_TAB_REQUIRED"
             | "APP_TIMEOUT"

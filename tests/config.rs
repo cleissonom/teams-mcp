@@ -3,6 +3,8 @@ use teams_mcp::config::{endpoint_from_port_file, is_teams_page, validate_endpoin
 #[test]
 fn only_literal_loopback_browser_websockets_are_accepted() {
     assert!(validate_endpoint("ws://127.0.0.1:9222/devtools/browser/test").is_ok());
+    assert!(validate_endpoint("ws://127.0.0.1:9222/devtools/browser").is_ok());
+    assert!(validate_endpoint("ws://[::1]:9222/devtools/browser").is_ok());
     for value in [
         "ws://evil.test:9222/devtools/browser/a",
         "ws://localhost:9222/devtools/browser/a",
@@ -10,6 +12,13 @@ fn only_literal_loopback_browser_websockets_are_accepted() {
         "ws://name:secret@127.0.0.1:9222/devtools/browser/a",
         "ws://127.0.0.1:9222/devtools/browser/a?secret=foo",
         "ws://0.0.0.0:9222/devtools/browser/a",
+        "ws://127.0.0.1:9222/devtools/browser/",
+        "ws://127.0.0.1:9222/devtools/browser//devtools/browser/",
+        "ws://127.0.0.1:9222/devtools/browser-other",
+        "ws://evil.test:9222/devtools/browser",
+        "ws://127.0.0.1:9222/devtools/browser?secret=foo",
+        "ws://127.0.0.1:9222/devtools/browser#fragment",
+        "ws://name:secret@127.0.0.1:9222/devtools/browser",
     ] {
         assert!(validate_endpoint(value).is_err(), "accepted {value}");
     }

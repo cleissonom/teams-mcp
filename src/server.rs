@@ -68,6 +68,13 @@ impl TeamsServer {
         self.config.prewarm
     }
 
+    /// Explicit CLI setup only; MCP tools never open a visible browser tab.
+    pub(crate) async fn open_browser_login_tab(&self) -> Result<(), Failure> {
+        tokio::time::timeout(self.config.request_timeout, self.browser.open_login_tab())
+            .await
+            .unwrap_or_else(|_| Err(self.request_timeout()))
+    }
+
     pub async fn execute(&self, name: &str, args: Value) -> Result<Value, Failure> {
         let started = Instant::now();
         let result = tokio::time::timeout(self.config.request_timeout, async {

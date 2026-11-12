@@ -10,7 +10,7 @@ use teams_mcp::{
 const USAGE: &str = "Usage: teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version], or teams-mcp auth login [--no-wait]|stop|status|compact.";
 const HELP: &str = "teams-mcp [--auth-source headless|browser|app] [--pretty] [--status | --call TOOL JSON | --help | --version]
 
-teams-mcp auth login     Guide and wait for normal sign-in in the selected existing browser or App.
+teams-mcp auth login     Open Teams if needed and wait for sign-in in the existing browser; App mode checks its session.
 teams-mcp auth login --no-wait   Show guidance and check the existing session once.
 teams-mcp --auth-source headless auth login   Wait for active reads, open managed sign-in, save the selected account and close setup.
 teams-mcp --auth-source headless auth login --no-wait   Open managed setup and return; finish with --auth-source headless auth stop.
